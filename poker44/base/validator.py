@@ -226,17 +226,64 @@ class BaseValidatorNeuron(BaseNeuron):
                 f"Scores contain NaN values. This may be due to a lack of responses from miners, or a bug in your reward functions."
             )
 
-        # Calculate the average reward for each uid across non-zero values.
-        # Replace any NaN values with 0.
-        # Compute the norm of the scores
-        norm = np.linalg.norm(self.scores, ord=1, axis=0, keepdims=True)
+        raw_weights = None
+        weights_source = "local_scores"
+        settlement_epoch_id = None
+        settlement_source_epoch_id = None
+        settlement_status = None
+        settlement_winner_uid = None
 
-        # Check if the norm is zero or contains NaN values
-        if np.any(norm == 0) or np.isnan(norm).any():
-            norm = np.ones_like(norm)  # Avoid division by zero or NaN
+        provider = getattr(self, "provider", None)
+        get_settlement = getattr(provider, "get_competition_settlement_weights", None)
+        if callable(get_settlement):
+            settlement_payload = get_settlement()
+            settlement_status = str(settlement_payload.get("status") or "").strip()
+            settlement_epoch_id = settlement_payload.get("epochId")
+            settlement_source_epoch_id = settlement_payload.get("sourceEpochId")
+            settlement_winner_uid = settlement_payload.get("winnerUid")
+            settlement_weights = settlement_payload.get("weights")
 
-        # Compute raw_weights safely
-        raw_weights = self.scores / norm
+            if settlement_status == "settled" and isinstance(settlement_weights, list):
+                raw_weights = np.zeros(self.metagraph.n, dtype=np.float32)
+                applied_count = 0
+                for entry in settlement_weights:
+                    if not isinstance(entry, dict):
+                        continue
+                    try:
+                        uid = int(entry.get("uid"))
+                        weight = float(entry.get("weight"))
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 <= uid < len(raw_weights) and np.isfinite(weight) and weight > 0:
+                        raw_weights[uid] = weight
+                        applied_count += 1
+
+                if applied_count > 0:
+                    weights_source = "competition_settlement"
+                    bt.logging.info(
+                        "Using backend-settled competition weights | "
+                        f"epoch={settlement_epoch_id} source_epoch={settlement_source_epoch_id} "
+                        f"winner_uid={settlement_winner_uid} nonzero={applied_count}"
+                    )
+                else:
+                    raw_weights = None
+                    bt.logging.warning(
+                        "Competition settlement returned no usable positive weights; "
+                        "falling back to local score weights."
+                    )
+
+        if raw_weights is None:
+            # Calculate the average reward for each uid across non-zero values.
+            # Replace any NaN values with 0.
+            # Compute the norm of the scores
+            norm = np.linalg.norm(self.scores, ord=1, axis=0, keepdims=True)
+
+            # Check if the norm is zero or contains NaN values
+            if np.any(norm == 0) or np.isnan(norm).any():
+                norm = np.ones_like(norm)  # Avoid division by zero or NaN
+
+            # Compute raw_weights safely
+            raw_weights = self.scores / norm
 
         bt.logging.debug("raw_weights", raw_weights)
         bt.logging.debug("raw_weight_uids", str(self.metagraph.uids.tolist()))
@@ -325,6 +372,11 @@ class BaseValidatorNeuron(BaseNeuron):
                     "last_set_weights_wait_for_inclusion": wait_for_inclusion,
                     "last_set_weights_wait_for_finalization": wait_for_finalization,
                     "last_set_weights_nonzero_uids": nonzero_uids,
+                    "last_set_weights_source": weights_source,
+                    "last_settlement_epoch_id": settlement_epoch_id,
+                    "last_settlement_source_epoch_id": settlement_source_epoch_id,
+                    "last_settlement_status": settlement_status,
+                    "last_settlement_winner_uid": settlement_winner_uid,
                 },
             )
         wandb_helper = getattr(self, "wandb_helper", None)

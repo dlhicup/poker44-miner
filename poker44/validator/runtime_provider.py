@@ -199,6 +199,26 @@ class ProviderRuntimeDatasetProvider:
         self._pending_hand_ids: List[str] = []
         self._active_chunk_id: str = ""
 
+    def get_competition_settlement_weights(self) -> Dict[str, Any]:
+        try:
+            payload = self.manager.client.get("/internal/competition/current/weights")
+            if not isinstance(payload, dict):
+                raise RuntimeError("Unexpected competition settlement payload shape")
+            return payload
+        except Exception as exc:
+            bt.logging.warning(f"Competition settlement weights fetch failed: {exc}")
+            return {
+                "epochId": self.stats.get("competition_epoch_id"),
+                "settlementMode": "winner_take_all",
+                "status": "unavailable",
+                "sourceEpochId": None,
+                "settledAt": None,
+                "winnerUid": None,
+                "winnerHotkey": None,
+                "reason": str(exc),
+                "weights": [],
+            }
+
     @property
     def dataset_hash(self) -> str:
         return self._dataset_hash

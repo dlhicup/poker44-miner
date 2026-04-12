@@ -103,10 +103,18 @@ platform can expose:
 
 The intended competition model is:
 
-- weekly epoch;
+- weekly epoch (Monday 20:00 UTC to Monday 20:00 UTC);
 - continuous evaluation on canonical live hands during the epoch;
 - public provisional leaderboard during the week;
-- target settlement model: winner-take-all.
+- winner-take-all settlement after the epoch closes.
+
+Settlement behavior in `dev` now follows a platform-decided pattern:
+
+- during the week, validators continue using local score-based weights;
+- after the backend settles the latest closed epoch, validators fetch the
+  canonical settlement vector from `/internal/competition/current/weights`;
+- if no epoch has been settled yet, validators fall back safely rather than
+  blocking `set_weights()`.
 
 Important nuance:
 
