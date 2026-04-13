@@ -285,6 +285,12 @@ async def _run_forward_cycle(validator) -> None:
         metrics_map=metrics_map,
         response_metadata=response_metadata,
     )
+    report_competition_scores = getattr(validator, "_report_competition_scores", None)
+    if callable(report_competition_scores):
+        try:
+            report_competition_scores()
+        except Exception as exc:
+            bt.logging.warning(f"Competition score reporting failed: {exc}")
     bt.logging.info(f"Reward map by UID: {reward_map}")
     bt.logging.info(f"Reward metrics by UID: {metrics_map}")
     winner_uids, winner_rewards = _select_weight_targets(reward_map)

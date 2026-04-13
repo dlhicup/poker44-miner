@@ -61,6 +61,9 @@ DEFAULT_VALIDATOR_RUNTIME_REPORT_URL = (
 DEFAULT_NETWORK_SNAPSHOT_REPORT_URL = (
     "https://api.poker44.net/internal/network/snapshots"
 )
+DEFAULT_COMPETITION_SCORE_REPORT_URL = (
+    "https://api.poker44.net/internal/competition/report-scores"
+)
 
 
 class Validator(BaseValidatorNeuron):
@@ -292,6 +295,68 @@ class Validator(BaseValidatorNeuron):
                     "Validator network snapshot report failed | "
                     f"url={network_report_url} message={message}"
                 )
+
+    def _report_competition_scores(self) -> None:
+        rows = list(getattr(self, "competition_scores_payload", []) or [])
+        if not rows:
+            return
+
+        provider_stats = (
+            getattr(self.provider, "stats", {})
+            if hasattr(self, "provider") and hasattr(self.provider, "stats")
+            else {}
+        )
+        payload = {
+            "hotkey": self.wallet.hotkey.ss58_address,
+            "validator_uid": self.resolve_uid(self.wallet.hotkey.ss58_address),
+            "competition_epoch_id": provider_stats.get("competition_epoch_id"),
+            "competition_epoch_start": provider_stats.get("competition_epoch_start"),
+            "competition_epoch_end": provider_stats.get("competition_epoch_end"),
+            "active_chunk_id": provider_stats.get("active_chunk_id"),
+            "active_chunk_hash": provider_stats.get("active_chunk_hash"),
+            "active_window_start": provider_stats.get("active_window_start"),
+            "active_window_end": provider_stats.get("active_window_end"),
+            "competition_scores": rows,
+        }
+        epoch_id = str(payload.get("competition_epoch_id") or "").strip()
+        if not epoch_id:
+            bt.logging.warning(
+                "Skipping competition score report because provider stats do not contain a competition epoch id."
+            )
+            return
+
+        report_url = str(
+            os.getenv(
+                "POKER44_COMPETITION_SCORE_REPORT_URL",
+                DEFAULT_COMPETITION_SCORE_REPORT_URL,
+            )
+        ).strip()
+        if not report_url:
+            return
+
+        timeout_seconds = float(
+            os.getenv("POKER44_COMPETITION_SCORE_REPORT_TIMEOUT_SECONDS", "5")
+        )
+        signed_request = build_signed_runtime_request(
+            wallet=self.wallet,
+            url=report_url,
+            payload=payload,
+        )
+        ok, message = post_runtime_snapshot(
+            url=report_url,
+            payload=payload,
+            timeout_seconds=timeout_seconds,
+            **signed_request,
+        )
+        if ok:
+            bt.logging.debug(
+                f"Competition score report delivered successfully: {report_url}"
+            )
+        else:
+            bt.logging.warning(
+                "Competition score report failed | "
+                f"url={report_url} message={message}"
+            )
 
     async def forward(self, synapse=None):  # type: ignore[override]
         return await forward_cycle(self)

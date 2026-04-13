@@ -344,6 +344,7 @@ class ProviderRuntimeDatasetProvider:
 
             batches: List[LabeledHandBatch] = []
             hand_ids: List[str] = []
+            batch_refs_raw = payload.get("batch_refs") if isinstance(payload, dict) else None
             for entry in batches_raw:
                 if not isinstance(entry, dict):
                     continue
@@ -353,8 +354,21 @@ class ProviderRuntimeDatasetProvider:
                 normalized_hands = [hand for hand in hands_raw if isinstance(hand, dict)]
                 if not normalized_hands:
                     continue
-                is_human = bool(entry.get("is_human", False))
+                is_human = not bool(entry.get("is_bot", False))
                 batches.append(LabeledHandBatch(hands=normalized_hands, is_human=is_human))  # type: ignore[arg-type]
+                batch_index = len(batches) - 1
+                batch_ref = (
+                    batch_refs_raw[batch_index]
+                    if isinstance(batch_refs_raw, list) and batch_index < len(batch_refs_raw)
+                    else None
+                )
+                candidate_hand_ids = batch_ref.get("hand_ids") if isinstance(batch_ref, dict) else None
+                if isinstance(candidate_hand_ids, list):
+                    for raw_hand_id in candidate_hand_ids:
+                        hand_id = str(raw_hand_id or "").strip()
+                        if hand_id:
+                            hand_ids.append(hand_id)
+                    continue
                 for hand in normalized_hands:
                     hand_id = str(hand.get("hand_id") or "").strip()
                     if hand_id:
