@@ -21,8 +21,8 @@ but it is no longer the target production operating path.
 
 ### Poker44 platform infrastructure owns
 
-- the live provider table;
-- bots seated at that table;
+- the live benchmark tables;
+- bots seated at those tables;
 - real-time gameplay;
 - SQL persistence of hands and events;
 - sanitization of evaluation payloads;
@@ -48,7 +48,7 @@ The validator fetches `batches` from the central eval API. Each returned batch c
 
 - one hidden label (`is_human`) on the validator side only;
 - one list of `hands`;
-- today, each batch typically contains a single sanitized hand/example.
+- one chunk-sized evaluation unit that may contain one or many sanitized hands.
 
 Then the validator converts those batches into:
 
@@ -58,7 +58,7 @@ Where:
 
 - `chunks` is a list of chunks;
 - each chunk is a list of sanitized hands;
-- today, each chunk is usually a one-hand chunk;
+- each chunk may contain one or many sanitized hands;
 - miners return one score per chunk.
 
 So the current production path is **not** “one label for the entire epoch payload”.
@@ -66,7 +66,8 @@ Instead:
 
 - the active eval payload contains many labeled batches;
 - the validator scores miners batch-by-batch;
-- each batch currently corresponds to one sanitized hand/example.
+- each individual batch/chunk is homogeneous, so the hands inside it are all human or all bot;
+- each batch/chunk remains one scoring unit from the validator’s point of view.
 
 Relevant code:
 
@@ -79,10 +80,10 @@ Relevant code:
 
 The current production source is:
 
-1. a single live provider table runs on Poker44 platform infrastructure;
-2. that table contains both human and bot seats;
+1. live benchmark tables run on Poker44 platform infrastructure;
+2. those tables contain both human and bot seats;
 3. all hands are persisted to platform SQL;
-4. `poker44-platform-backend` scans unconsumed hands and builds sanitized evaluation batches;
+4. `poker44-platform-backend` builds sanitized evaluation batches from those benchmark-table hands;
 5. if `requireMixed=true`, only source hands that include both human and bot participation are eligible;
 6. the backend publishes an active canonical chunk for the epoch/window;
 7. validators read that active chunk through `/internal/eval/current`.
@@ -104,23 +105,33 @@ platform can expose:
 The intended competition model is:
 
 - weekly epoch (Monday 20:00 UTC to Monday 20:00 UTC);
+- canonical eval windows of 2 hours inside that weekly epoch;
 - continuous evaluation on canonical live hands during the epoch;
 - public provisional leaderboard during the week;
 - winner-take-all settlement after the epoch closes.
 
 Settlement behavior in `dev` now follows a platform-decided pattern:
 
-- during the week, validators continue using local score-based weights;
-- after the backend settles the latest closed epoch, validators fetch the
-  canonical settlement vector from `/internal/competition/current/weights`;
-- if no epoch has been settled yet, validators fall back safely rather than
-  blocking `set_weights()`.
+- validators fetch the canonical competition vector from
+  `/internal/competition/current/weights`;
+- once the backend has settled at least one weekly winner, the latest settled
+  winner becomes the canonical competition vector for the current/vigente
+  period, but validators apply a Swarm-style burn on top of it:
+  `97%` to `uid 0`, `3%` to the backend-provided winner vector;
+- before the first weekly settlement exists, the backend returns its explicit
+  fallback vector (typically `uid 0`, which remains `100%` burned);
+- validators only fall back to local score-based weights if the backend is
+  unavailable or returns no usable positive vector.
 
 Important nuance:
 
-- source hands come from mixed live tables;
+- source hands come from live benchmark tables;
+- the backend rotates the active canonical chunk on 2-hour windows;
+- validators poll that runtime continuously (`POKER44_POLL_INTERVAL_SECONDS`,
+  300s by default) and can score the active window multiple times before the
+  next window opens;
 - the published payload can contain both human-labeled and bot-labeled batches;
-- but each delivered batch/chunk is still currently a one-example unit from the validator’s point of view.
+- each delivered batch/chunk is still one scoring unit from the validator’s point of view.
 
 ## Pull + Restart Contract
 
@@ -227,7 +238,7 @@ Notes:
 - `POKER44_PROVIDER_INTERNAL_SECRET` is required for `/internal/eval/*`;
 - `POKER44_CHUNK_COUNT` controls how many batches/chunks the validator will forward to miners in
   one cycle;
-- today those batches are usually one sanitized hand/example each.
+- each batch/chunk may contain one or many sanitized hands.
 
 ## Run Validator
 
@@ -242,7 +253,7 @@ WALLET_NAME=p44_cold \
 HOTKEY=p44_validator \
 POKER44_RUNTIME_MODE=provider_runtime \
 POKER44_PROVIDER_INTERNAL_SECRET=replace-with-real-shared-secret \
-POKER44_EVAL_API_BASE_URL=http://185.196.20.208:4001 \
+POKER44_EVAL_API_BASE_URL=https://api-dev.poker44.net \
 ./scripts/validator/run/run_vali.sh
 ```
 
@@ -250,9 +261,9 @@ POKER44_EVAL_API_BASE_URL=http://185.196.20.208:4001 \
 
 The current lifecycle is:
 
-1. platform table generates real hands;
+1. live benchmark tables generate real hands;
 2. hands are persisted in SQL;
-3. backend selects eligible unconsumed hands;
+3. backend selects eligible benchmark-table hands;
 4. backend builds sanitized labeled batches from those hands;
 5. backend publishes an active canonical chunk for the current window;
 6. validator fetches it through `/internal/eval/current`;
@@ -266,13 +277,13 @@ Current scoring granularity is:
 
 - one returned score per chunk;
 - one validator label per chunk;
-- today, one chunk is usually one sanitized hand/example.
+- one chunk may contain one or many sanitized hands.
 
 This matters for miner/operator expectations:
 
-- the live source is mixed-table gameplay;
+- the live source is benchmark-table gameplay;
 - the current validator scoring contract is still chunk-level;
-- the chunk-level contract is currently implemented as many one-example chunks.
+- the chunk-level contract is implemented as `list[list[hand]]`, with one score expected per chunk.
 
 ## What the Validator Does Not Do
 

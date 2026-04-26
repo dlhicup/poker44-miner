@@ -5,11 +5,11 @@ Production-facing miner guide for Poker44 subnet `126`.
 ## What Miners Are Solving Today
 
 Poker44 validators currently evaluate miners with sanitized behavioral payloads derived from
-live Poker44 platform tables.
+live Poker44 benchmark tables.
 
 Current production path:
 
-1. a live provider table runs on Poker44 platform infrastructure;
+1. live benchmark tables run on Poker44 platform infrastructure;
 2. those hands are persisted in platform SQL;
 3. `poker44-platform-backend` builds sanitized labeled evaluation batches from those hands;
 4. the validator fetches the active batch set through `/internal/eval/current`;
@@ -27,8 +27,7 @@ Current semantics:
 
 - `chunks` is a list of chunks;
 - each chunk is a list of sanitized hand payloads;
-- today, in the live `provider_runtime` path, each chunk is typically a single sanitized
-  hand/example;
+- each chunk may contain one or many sanitized hands;
 - the validator expects exactly one `risk_score` per chunk.
 
 So today the practical task is:
@@ -47,24 +46,23 @@ Relevant code:
 
 There are two different layers:
 
-1. source hands on platform tables
+1. source hands on benchmark tables
 2. chunks delivered to miners
 
-Today, platform source hands are collected from live mixed tables where humans and bots sit
+Today, platform source hands are collected from live benchmark tables where humans and bots sit
 together.
 
 But the chunk format delivered to miners is still aligned with the current scoring path:
 
-- the backend turns each eligible player perspective into its own labeled batch;
-- each batch currently contains one sanitized hand/example;
+- the backend builds labeled batches from sanitized benchmark-table hands;
 - the validator groups those batches into `DetectionSynapse(chunks=...)`;
 - miners return one score per batch/chunk.
 
 So:
 
 - the overall validator request can contain both human-labeled and bot-labeled chunks;
-- but miners are **not** currently receiving a single multi-hand chunk that mixes hidden
-  human and bot labels inside the same chunk.
+- each individual chunk is homogeneous, so the hands inside a chunk are all human or all bot;
+- miners should not assume a fixed number of hands per chunk.
 
 Do not build your miner assuming this exact granularity will never evolve, but document and
 optimize against the contract that is live today: one score per received chunk.
@@ -75,10 +73,11 @@ The payload sent to miners is sanitized before inference.
 
 Current provider-runtime sanitization includes:
 
-- opaque `hand_id`
-- opaque `table_id`
-- opaque seat tokens
-- sanitized event sequence
+- `metadata`
+- `players`
+- `streets`
+- `actions`
+- `outcome`
 - no direct identity fields
 - no explicit ground-truth label
 

@@ -16,7 +16,7 @@ The public benchmark is **not** the same thing as production validator evaluatio
 
 Production validators now evaluate miners using:
 
-- live hands generated on Poker44 platform tables;
+- live hands generated on Poker44 benchmark tables;
 - centralized SQL persistence;
 - sanitizer-built batches exposed by the central eval API;
 - unseen batches delivered through the validator runtime.
@@ -109,6 +109,6 @@ Current production contract:
 
 - validators send `DetectionSynapse(chunks=...)`;
 - miners return one score per chunk;
-- today those chunks are usually one sanitized hand/example each.
+- each chunk may contain one or many sanitized hands.
 
 That production contract is sourced from live platform tables, not from this public artifact.

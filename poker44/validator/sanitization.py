@@ -193,7 +193,7 @@ def sanitize_hand_for_miner(hand_payload: Dict[str, Any]) -> Dict[str, Any]:
             "game_type": str(metadata.get("game_type", "")),
             "limit_type": str(metadata.get("limit_type", "")),
             "max_seats": max_seats,
-            "hero_seat": 0,
+            "hero_seat": _sanitize_seat(metadata.get("hero_seat"), max_seats=max_seats),
             "hand_ended_on_street": "",
             "button_seat": 0,
             "sb": _SANITIZED_SB,

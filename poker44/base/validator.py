@@ -23,7 +23,7 @@ import asyncio
 import argparse
 import threading
 import bittensor as bt
-from typing import List, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from traceback import print_exception
 from poker44.base.neuron import BaseNeuron
 from poker44.base.utils.weight_utils import (
@@ -31,6 +31,82 @@ from poker44.base.utils.weight_utils import (
     convert_weights_and_uids_for_emit,
 )
 from poker44.utils.config import add_validator_args
+
+
+UID_ZERO = 0
+BACKEND_BURN_FRACTION = 0.97
+BACKEND_KEEP_FRACTION = 1.0 - BACKEND_BURN_FRACTION
+
+
+def _extract_competition_weight_vector(
+    provider: Any,
+    metagraph_size: int,
+) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
+    """Resolve the canonical backend competition vector when available."""
+
+    metadata: Dict[str, Any] = {
+        "weights_source": "local_scores",
+        "settlement_epoch_id": None,
+        "settlement_source_epoch_id": None,
+        "settlement_status": None,
+        "settlement_winner_uid": None,
+    }
+
+    get_settlement = getattr(provider, "get_competition_settlement_weights", None)
+    if not callable(get_settlement):
+        return None, metadata
+
+    settlement_payload = get_settlement()
+    metadata["settlement_status"] = str(settlement_payload.get("status") or "").strip()
+    metadata["settlement_epoch_id"] = settlement_payload.get("epochId")
+    metadata["settlement_source_epoch_id"] = settlement_payload.get("sourceEpochId")
+    metadata["settlement_winner_uid"] = settlement_payload.get("winnerUid")
+    settlement_weights = settlement_payload.get("weights")
+
+    if not isinstance(settlement_weights, list):
+        return None, metadata
+
+    entries: List[Tuple[int, float]] = []
+    for entry in settlement_weights:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            uid = int(entry.get("uid"))
+            weight = float(entry.get("weight"))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= uid < metagraph_size and np.isfinite(weight) and weight > 0:
+            entries.append((uid, weight))
+
+    if not entries:
+        return None, metadata
+
+    raw_weights = np.zeros(metagraph_size, dtype=np.float32)
+    has_uid_zero = any(uid == UID_ZERO for uid, _ in entries)
+
+    if has_uid_zero:
+        for uid, weight in entries:
+            raw_weights[uid] = weight
+    else:
+        total_weight = sum(weight for _, weight in entries)
+        if total_weight <= 0:
+            return None, metadata
+        for uid, weight in entries:
+            raw_weights[uid] = float(weight) * BACKEND_KEEP_FRACTION / float(total_weight)
+        if 0 <= UID_ZERO < metagraph_size:
+            raw_weights[UID_ZERO] = BACKEND_BURN_FRACTION
+
+    status = metadata["settlement_status"]
+    if status == "settled":
+        metadata["weights_source"] = "competition_settlement"
+    elif status == "fallback":
+        metadata["weights_source"] = "competition_fallback"
+    else:
+        metadata["weights_source"] = "competition_runtime"
+    metadata["burn_fraction"] = BACKEND_BURN_FRACTION if not has_uid_zero else None
+    metadata["keep_fraction"] = BACKEND_KEEP_FRACTION if not has_uid_zero else None
+
+    return raw_weights, metadata
 
 
 class BaseValidatorNeuron(BaseNeuron):
@@ -226,51 +302,38 @@ class BaseValidatorNeuron(BaseNeuron):
                 f"Scores contain NaN values. This may be due to a lack of responses from miners, or a bug in your reward functions."
             )
 
-        raw_weights = None
-        weights_source = "local_scores"
-        settlement_epoch_id = None
-        settlement_source_epoch_id = None
-        settlement_status = None
-        settlement_winner_uid = None
-
         provider = getattr(self, "provider", None)
-        get_settlement = getattr(provider, "get_competition_settlement_weights", None)
-        if callable(get_settlement):
-            settlement_payload = get_settlement()
-            settlement_status = str(settlement_payload.get("status") or "").strip()
-            settlement_epoch_id = settlement_payload.get("epochId")
-            settlement_source_epoch_id = settlement_payload.get("sourceEpochId")
-            settlement_winner_uid = settlement_payload.get("winnerUid")
-            settlement_weights = settlement_payload.get("weights")
+        raw_weights, competition_weight_metadata = _extract_competition_weight_vector(
+            provider=provider,
+            metagraph_size=self.metagraph.n,
+        )
+        weights_source = str(competition_weight_metadata["weights_source"])
+        settlement_epoch_id = competition_weight_metadata["settlement_epoch_id"]
+        settlement_source_epoch_id = competition_weight_metadata["settlement_source_epoch_id"]
+        settlement_status = competition_weight_metadata["settlement_status"]
+        settlement_winner_uid = competition_weight_metadata["settlement_winner_uid"]
 
-            if settlement_status == "settled" and isinstance(settlement_weights, list):
-                raw_weights = np.zeros(self.metagraph.n, dtype=np.float32)
-                applied_count = 0
-                for entry in settlement_weights:
-                    if not isinstance(entry, dict):
-                        continue
-                    try:
-                        uid = int(entry.get("uid"))
-                        weight = float(entry.get("weight"))
-                    except (TypeError, ValueError):
-                        continue
-                    if 0 <= uid < len(raw_weights) and np.isfinite(weight) and weight > 0:
-                        raw_weights[uid] = weight
-                        applied_count += 1
-
-                if applied_count > 0:
-                    weights_source = "competition_settlement"
-                    bt.logging.info(
-                        "Using backend-settled competition weights | "
-                        f"epoch={settlement_epoch_id} source_epoch={settlement_source_epoch_id} "
-                        f"winner_uid={settlement_winner_uid} nonzero={applied_count}"
-                    )
-                else:
-                    raw_weights = None
-                    bt.logging.warning(
-                        "Competition settlement returned no usable positive weights; "
-                        "falling back to local score weights."
-                    )
+        if raw_weights is not None:
+            nonzero_count = int(np.count_nonzero(raw_weights))
+            if weights_source == "competition_settlement":
+                bt.logging.info(
+                    "Using backend-settled competition weights | "
+                    f"epoch={settlement_epoch_id} source_epoch={settlement_source_epoch_id} "
+                    f"winner_uid={settlement_winner_uid} nonzero={nonzero_count}"
+                )
+            elif weights_source == "competition_fallback":
+                bt.logging.info(
+                    "Using backend fallback competition weights | "
+                    f"epoch={settlement_epoch_id} source_epoch={settlement_source_epoch_id} "
+                    f"winner_uid={settlement_winner_uid} nonzero={nonzero_count}"
+                )
+            else:
+                bt.logging.info(
+                    "Using backend competition weights | "
+                    f"status={settlement_status} epoch={settlement_epoch_id} "
+                    f"source_epoch={settlement_source_epoch_id} winner_uid={settlement_winner_uid} "
+                    f"nonzero={nonzero_count}"
+                )
 
         if raw_weights is None:
             # Calculate the average reward for each uid across non-zero values.

@@ -36,10 +36,10 @@ Poker44 is security infrastructure, not a poker room.
 
 The current production direction is:
 
-- a live provider table runs on Poker44 platform infrastructure;
-- that table includes both human and bot seats;
+- live benchmark tables run on Poker44 platform infrastructure;
+- those tables include both human and bot seats;
 - hands are persisted to central platform SQL;
-- `poker44-platform-backend` builds sanitized evaluation batches from those hands;
+- `poker44-platform-backend` builds sanitized evaluation batches from those benchmark-table hands;
 - validators do **not** run their own tables;
 - validators fetch the active canonical batch set through the central eval API;
 - validators send those batches to miners, compute rewards, and set weights.
@@ -67,12 +67,13 @@ Current semantics:
 - `chunks` is a list of chunks;
 - each chunk is a list of sanitized hand payloads;
 - validators expect one `risk_score` per chunk;
-- today, in the live `provider_runtime` path, each chunk is usually one sanitized hand/example.
+- each chunk may contain one or many sanitized hands.
 
 This means:
 
 - the overall validator request can contain both human-labeled and bot-labeled chunks;
-- but miners are not currently receiving a single mixed multi-hand chunk with one global label.
+- each individual chunk is homogeneous, so the hands inside a chunk are all human or all bot;
+- miners should treat each chunk as one scoring unit, regardless of how many hands it contains.
 
 The competition framing in `dev` should be understood as:
 
@@ -80,6 +81,14 @@ The competition framing in `dev` should be understood as:
 - continuous evaluation on canonical live batches during that epoch;
 - public provisional leaderboard derived from the signed subnet snapshot;
 - target settlement model: winner-take-all.
+
+In the current `dev` runtime, validators read the canonical competition weight
+vector from the backend. Once the backend has settled at least one weekly
+winner, that latest settled winner becomes the active on-chain competitive
+allocation for the current period: `97%` is burned to `uid 0`, and the
+remaining `3%` follows the backend-provided winner vector. Before the first
+settlement exists, the backend returns its explicit fallback vector (typically
+`uid 0`, which keeps the burn at `100%`).
 
 See:
 
@@ -94,7 +103,7 @@ See:
 
 Production validators now target:
 
-- live hands from Poker44 platform tables;
+- live hands from Poker44 benchmark tables;
 - SQL-persisted events and hand results;
 - centralized sanitized batch generation through `/internal/eval/*`.
 
