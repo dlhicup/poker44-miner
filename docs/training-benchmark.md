@@ -21,6 +21,8 @@ testing, and regression testing.
 https://api.poker44.net/api/v1/benchmark
 ```
 
+The benchmark API is public and does not require authentication.
+
 ## Endpoints
 
 ```text
@@ -30,9 +32,14 @@ GET /api/v1/benchmark/chunks?sourceDate=YYYY-MM-DD
 GET /api/v1/benchmark/chunks/:chunkId
 ```
 
-## Status
+There is no separate `/training/latest` endpoint. To use the latest benchmark,
+first call the status endpoint, read `latestSourceDate`, then request chunks for
+that date.
 
-`GET /api/v1/benchmark` returns aggregate availability:
+## Latest Benchmark
+
+`GET /api/v1/benchmark` returns aggregate availability and the latest published
+training benchmark date.
 
 - `releaseVersion`
 - `schemaVersion`
@@ -42,6 +49,9 @@ GET /api/v1/benchmark/chunks/:chunkId
 - `latestSourceDate`
 - `latestReleasedAt`
 - `currentUtcDate`
+- `minimumHumanExamplesPerRelease`
+- `targetHumanExamplesPerRelease`
+- `defaultChunkLimit`
 - `autoRelease`
 
 Example:
@@ -50,9 +60,13 @@ Example:
 curl -sS https://api.poker44.net/api/v1/benchmark
 ```
 
+Use `latestSourceDate` from this response as the `sourceDate` for chunk
+downloads.
+
 ## Releases
 
-`GET /api/v1/benchmark/releases` returns available benchmark dates.
+`GET /api/v1/benchmark/releases` returns the history of published training
+benchmark releases.
 
 Common query parameters:
 
@@ -78,6 +92,9 @@ Each release includes:
 - `audit`
 - `metadata`
 
+Use releases to compare model behavior across benchmark versions. For normal
+development, start from the latest `sourceDate`.
+
 ## Chunks
 
 `GET /api/v1/benchmark/chunks?sourceDate=YYYY-MM-DD` returns chunk payloads for
@@ -93,18 +110,20 @@ Common query parameters:
 Example:
 
 ```bash
-curl -sS 'https://api.poker44.net/api/v1/benchmark/chunks?sourceDate=2026-06-10&limit=24'
+curl -sS 'https://api.poker44.net/api/v1/benchmark/chunks?sourceDate=2026-07-06&limit=24'
 ```
 
 Each chunk includes:
 
 - `chunkId`
 - `chunkHash`
+- `chunkIndex`
 - `sourceDate`
 - `releaseVersion`
 - `split`
 - `handCount`
 - `batchCount`
+- `chunkCount`
 - `chunks`
 - `groundTruth`
 - `groundTruthLabels`
@@ -133,7 +152,9 @@ Minimal validation example:
 import requests
 
 base_url = "https://api.poker44.net/api/v1/benchmark"
-source_date = "2026-06-10"
+
+status = requests.get(base_url, timeout=30).json()["data"]
+source_date = status["latestSourceDate"]
 
 payload = requests.get(
     f"{base_url}/chunks",
@@ -149,6 +170,31 @@ for chunk in payload["chunks"]:
 
     assert len(predictions) == len(labels)
     assert all(0.0 <= score <= 1.0 for score in predictions)
+```
+
+Paginated download example:
+
+```python
+import requests
+
+base_url = "https://api.poker44.net/api/v1/benchmark"
+source_date = requests.get(base_url, timeout=30).json()["data"]["latestSourceDate"]
+
+all_chunks = []
+cursor = None
+
+while True:
+    params = {"sourceDate": source_date, "limit": 24}
+    if cursor:
+        params["cursor"] = cursor
+
+    data = requests.get(f"{base_url}/chunks", params=params, timeout=60).json()["data"]
+    all_chunks.extend(data["chunks"])
+    cursor = data.get("nextCursor")
+    if not cursor:
+        break
+
+print(f"downloaded {len(all_chunks)} chunks for {source_date}")
 ```
 
 ## Hand Fields
@@ -203,15 +249,16 @@ Useful metrics:
 
 ## Recommended Workflow
 
-1. Fetch release dates from `/releases`.
-2. Download chunks by `sourceDate`.
-3. Cache raw responses and record `chunkHash`.
-4. Split by release date and by the returned `split` field when present.
-5. Build features only from miner-visible hand and action data.
-6. Train on `train` chunks.
-7. Tune and compare on `validation` chunks.
-8. Keep a held-out local set for model regression tests.
-9. Track performance by release date and model version.
+1. Fetch status from `/api/v1/benchmark`.
+2. Read `latestSourceDate`.
+3. Download chunks with `/api/v1/benchmark/chunks?sourceDate=YYYY-MM-DD`.
+4. Cache raw responses and record `chunkHash`.
+5. Split by release date and by the returned `split` field when present.
+6. Build features only from miner-visible hand and action data.
+7. Train on `train` chunks.
+8. Tune and compare on `validation` chunks.
+9. Keep a held-out local set for model regression tests.
+10. Track performance by release date and model version.
 
 ## Common Mistakes
 
@@ -225,6 +272,10 @@ Useful metrics:
 ## Notes
 
 - New releases may be added over time.
+- The status endpoint is the source of truth for the latest public benchmark
+  date.
+- The releases endpoint is for history and comparison across benchmark
+  versions.
 - Response fields may expand, so clients should ignore unknown fields.
 - The chunk order and label order are significant.
 - Avoid tuning a model against a single release only.
