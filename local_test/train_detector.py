@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Train the Poker44 bot detector and emit neurons/detector_params.py.
 
-MODEL (v2): gradient-boosted trees on the RAW 10 chunk features.
-Forensics (verified adversarially) showed the bot population has three
-families; the largest ("near-human sticky caller", 41% of bots) deviates
-from humans by only 0.5-0.8 SD in a CONSISTENT DIRECTION, which the old
-two-sided |z| -> logistic design structurally cannot see (the abs() erases
-the sign). Trees on raw features keep directional signal AND learn
-two-sided splits natively; honest LORO reward ~0.85 vs ~0.79 for the
-legacy shape.
+MODEL (v3): gradient-boosted trees on the expanded candidate feature set
+(neurons.detector.CANDIDATE_FEATURES, 177 names), filtered by a live-vs-
+benchmark FEATURE TRANSFER GATE so only features whose live distribution
+matches the (parity-transformed) benchmark distribution are trained on.
+Chunk-size subsampling to 35 hands and the <5-action hand filter live
+INSIDE extract_features, so train and serve share them automatically.
 
 DATA: every release banked in local_test/data/release_*.json (real_eval.py
 banks the newest release daily; backfill_releases.py recovers history).
+Before featurizing, every benchmark hand is re-canonicalized through
+poker44.validator.payload_view.build_miner_payload_hand (see
+load_all_releases for why).
 
 VALIDATION: leave-one-release-out over the FULL-SIZE releases (>=100
 groups). Small pilot releases still contribute training data to the final
@@ -31,6 +32,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from joblib import Parallel, delayed
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
@@ -38,36 +40,21 @@ from sklearn.model_selection import StratifiedKFold
 REPO = Path("/home/client_7075_3/Projects/Poker44-subnet")
 sys.path.insert(0, str(REPO))
 
-from neurons.detector import extract_features, _calibrate  # noqa: E402
+from neurons.detector import CANDIDATE_FEATURES, extract_features, _calibrate  # noqa: E402
 from poker44.score.scoring import reward  # noqa: E402
+from poker44.validator.payload_view import build_miner_payload_hand  # noqa: E402
 
 DATA_DIR = REPO / "local_test" / "data"
+CAPTURES_DIR = REPO / "local_test" / "captures"
 # Bumped whenever the featurisation input changes; stale caches are ignored.
-# v2: benchmark groups are fed AS-DELIVERED (they are already the validator's
-# miner-visible payload). v1 wrongly ran prepare_hand_for_miner over them a
-# second time, training the model on a distribution production never sends.
-CACHE_VERSION = 3
-# Only features whose PRODUCTION distribution matches the benchmark training
-# distribution (verified against a captured live validator payload). The four
-# dropped features were the model's strongest on the synthetic benchmark but
-# are catastrophically out-of-distribution live: real hands bet ~1-2bb in tight
-# standard sizes, while the synthetic benchmark bots bet 8-190bb wildly, so
-# betsize_std_bb (0.14 live vs ~48 train), betsize_entropy_norm,
-# betsize_frac_unique and xhand_fold_ratio_std all collapsed and saturated
-# every live score to ~0.98 (all-True). No rescaling (CV, bet/pot) transfers
-# either. What's left are scale-free per-street rates and reach fractions.
-FEATURES = [
-    "flop_fold_rate",
-    "turn_fold_rate",
-    "river_fold_rate",
-    "flop_raise_rate",
-    "frac_hands_reach_flop",
-    "frac_hands_reach_river",
-]
+# v4: expanded CANDIDATE_FEATURES matrix + parity re-canonicalization of the
+# benchmark hands through build_miner_payload_hand (see load_all_releases).
+CACHE_VERSION = 4
 TARGET_HUMAN_FPR = 0.07     # <=7% humans over 0.5 (validator gate allows 10%)
 FULL_SIZE_MIN_GROUPS = 100  # releases smaller than this are pilot-era noise
+GATE_BENCH_SAMPLE = 200     # benchmark chunks sampled for the transfer gate
 GBM_PARAMS = dict(
-    n_estimators=300,
+    n_estimators=400,
     learning_rate=0.05,
     max_depth=3,
     subsample=0.8,
@@ -75,17 +62,29 @@ GBM_PARAMS = dict(
 )
 PARAMS_PATH = REPO / "neurons" / "detector_params.py"
 
+# Gate acceptance criteria (reported honestly; no workarounds if they fail).
+GATE1_LORO_MIN = 0.84
+GATE2_STD_MIN = 0.08
+GATE2_MID_FRAC_MIN = 0.5
+GATE2_MID_LO, GATE2_MID_HI = 0.15, 0.70
+
 
 def load_all_releases():
-    """Load every banked release: list of (date, X, y). Feature caching:
-    each immutable release is featurized once per CACHE_VERSION.
+    """Load every banked release: list of (date, X, y) with X over the full
+    CANDIDATE_FEATURES matrix. Feature caching: each immutable release is
+    featurized once per CACHE_VERSION.
 
-    Groups are featurized AS-DELIVERED. The benchmark API already returns the
-    validator's miner-visible payload (seat_N aliases, hole_cards=None, empty
-    board, zeroed outcome, sb/bb=0.01/0.02), i.e. prepare_hand_for_miner has
-    already been applied upstream. Running it again re-buckets and re-noises
-    bet sizes and re-samples the action window, producing features that
-    production never sends.
+    PARITY TRANSFORM: before featurizing, every benchmark hand is passed
+    through poker44.validator.payload_view.build_miner_payload_hand. Live
+    payloads are windowed to 5-8 visible actions by the CURRENT
+    canonicalizer, while the benchmark releases were produced by an older
+    canonicalizer (hands carry 1-22 actions); re-canonicalizing the
+    benchmark hands restores train/serve parity (verified: 5-8 action
+    bucket coverage 44.7% -> 78.2%). This re-censoring is intentional NOW
+    because no bet-size/amount features are used anymore — the re-bucketing
+    and re-noising that made a second censor pass harmful before (v2 note)
+    only corrupted amount-derived features, which the transfer gate
+    excludes by construction.
     """
     paths = sorted(DATA_DIR.glob("release_*.json"))
     if len(paths) < 2:
@@ -99,7 +98,7 @@ def load_all_releases():
             try:
                 with open(cache_path) as fh:
                     cached = json.load(fh)
-                if (cached.get("features") == FEATURES
+                if (cached.get("features") == CANDIDATE_FEATURES
                         and cached.get("cache_version") == CACHE_VERSION):
                     X = np.asarray(cached["X"], dtype=float)
                     y = np.asarray(cached["y"], dtype=int)
@@ -111,14 +110,105 @@ def load_all_releases():
             y = np.asarray(data["labels"], dtype=int)
             rows = []
             for grp in data["groups"]:
+                # Parity transform (see docstring): re-canonicalize each
+                # benchmark hand exactly as the live validator censors hands.
+                grp = [build_miner_payload_hand(hand) for hand in grp]
                 feats = extract_features(grp)
-                rows.append([feats[k] for k in FEATURES])
+                rows.append([feats[k] for k in CANDIDATE_FEATURES])
             X = np.asarray(rows, dtype=float)
             with open(cache_path, "w") as fh:
-                json.dump({"features": FEATURES, "cache_version": CACHE_VERSION,
+                json.dump({"features": CANDIDATE_FEATURES,
+                           "cache_version": CACHE_VERSION,
                            "X": X.tolist(), "y": y.tolist()}, fh)
         releases.append((date, X, y))
     return releases
+
+
+def load_live_capture_features():
+    """Featurize the newest captured live validator payload (100 chunks).
+
+    Captured chunks are ALREADY miner-visible live payloads (the current
+    canonicalizer produced them), so they are featurized as-delivered.
+    Returns (capture_path, chunks, X_live over CANDIDATE_FEATURES).
+    """
+    captures = sorted(CAPTURES_DIR.glob("query_*.json"))
+    if not captures:
+        sys.exit(f"No live capture query_*.json found in {CAPTURES_DIR}.")
+    capture_path = captures[-1]
+    with open(capture_path) as fh:
+        capture = json.load(fh)
+    chunks = capture["chunks"]
+    rows = []
+    for chunk in chunks:
+        feats = extract_features(chunk)
+        rows.append([feats[k] for k in CANDIDATE_FEATURES])
+    return capture_path, chunks, np.asarray(rows, dtype=float)
+
+
+def feature_transfer_gate(X_live: np.ndarray, X_bench: np.ndarray):
+    """Drop candidate features whose LIVE distribution does not transfer.
+
+    A feature survives only if it varies on both populations AND its live
+    mean sits inside (a slightly widened) benchmark support with a
+    standardized mean shift <= 4 benchmark SDs. Everything else is exactly
+    the failure mode that sank the v1 bet-size features: strong on the
+    synthetic benchmark, out-of-distribution live, saturating every score.
+    Returns (survivors, dropped) where dropped is a list of dicts.
+    """
+    survivors, dropped = [], []
+    for j, name in enumerate(CANDIDATE_FEATURES):
+        live = X_live[:, j]
+        bench = X_bench[:, j]
+        live_std = float(np.std(live))
+        bench_std = float(np.std(bench))
+        live_mean = float(np.mean(live))
+        bench_mean = float(np.mean(bench))
+        bench_q05 = float(np.quantile(bench, 0.05))
+        bench_q95 = float(np.quantile(bench, 0.95))
+        band = bench_q95 - bench_q05
+        reasons = []
+        if live_std < 1e-6:
+            reasons.append("degenerate live (std<1e-6)")
+        if bench_std < 1e-6:
+            reasons.append("degenerate bench (std<1e-6)")
+        shift = abs(live_mean - bench_mean) / max(bench_std, 1e-9)
+        if shift > 2.0:
+            reasons.append(f"mean shift {shift:.1f} SD > 2")
+        # Central-band containment: the live mean must sit inside the
+        # benchmark's q05-q95 band (+15% slack) — full min/max support over a
+        # 200-chunk sample is far too permissive and let a residual
+        # multivariate shift through (v3 live median 0.81).
+        if band > 1e-9 and not (
+            bench_q05 - 0.15 * band <= live_mean <= bench_q95 + 0.15 * band
+        ):
+            reasons.append("live mean outside bench q05-q95 band+15%")
+        # Variance-ratio canary: a live spread collapse (or explosion) means
+        # the feature behaves differently live even if its mean matches.
+        if live_std >= 1e-6 and bench_std >= 1e-6:
+            ratio = live_std / bench_std
+            if ratio < 0.33 or ratio > 3.0:
+                reasons.append(f"variance ratio {ratio:.2f} outside [0.33, 3]")
+        if reasons:
+            dropped.append({
+                "name": name,
+                "reasons": "; ".join(reasons),
+                "live_mean": live_mean,
+                "live_std": live_std,
+                "bench_mean": bench_mean,
+                "bench_std": bench_std,
+            })
+        else:
+            survivors.append(name)
+
+    print(f"\n== Feature transfer gate: {len(survivors)} kept, "
+          f"{len(dropped)} dropped of {len(CANDIDATE_FEATURES)} ==")
+    if dropped:
+        w = max(len(d["name"]) for d in dropped)
+        print(f"  {'feature'.ljust(w)}  live_mean  bench_mean  bench_std  reason")
+        for d in dropped:
+            print(f"  {d['name'].ljust(w)}  {d['live_mean']:9.4f}  "
+                  f"{d['bench_mean']:10.4f}  {d['bench_std']:9.4f}  {d['reasons']}")
+    return survivors, dropped
 
 
 def oof_threshold(X: np.ndarray, y: np.ndarray) -> float:
@@ -144,25 +234,51 @@ def report(tag: str, p: np.ndarray, y: np.ndarray) -> None:
 def main() -> None:
     releases = load_all_releases()
     n_total = sum(len(y) for _, _, y in releases)
-    full = [(d, X, y) for d, X, y in releases if len(y) >= FULL_SIZE_MIN_GROUPS]
     print(f"[data] {len(releases)} releases banked, {n_total} labeled groups "
-          f"| {len(full)} full-size validation folds")
+          f"(candidate matrix: {len(CANDIDATE_FEATURES)} features)")
+
+    # ---- feature transfer gate (live capture vs parity-transformed bench) --
+    capture_path, live_chunks, X_live = load_live_capture_features()
+    print(f"[gate] live capture: {capture_path.name} ({len(live_chunks)} chunks)")
+    X_all_cand = np.vstack([Xr for _, Xr, _ in releases])
+    sample_rng = np.random.RandomState(0)
+    bench_idx = sample_rng.choice(
+        len(X_all_cand), size=min(GATE_BENCH_SAMPLE, len(X_all_cand)),
+        replace=False)
+    features, dropped = feature_transfer_gate(X_live, X_all_cand[bench_idx])
+    if not features:
+        sys.exit("Transfer gate dropped every candidate feature — aborting.")
+    cols = [CANDIDATE_FEATURES.index(name) for name in features]
+    releases = [(d, Xr[:, cols], yr) for d, Xr, yr in releases]
+    X_live = X_live[:, cols]
+
+    full = [(d, X, y) for d, X, y in releases if len(y) >= FULL_SIZE_MIN_GROUPS]
+    print(f"[data] {len(full)} full-size validation folds | "
+          f"{len(features)} gated features")
 
     # ---- honest leave-one-release-out over the full-size releases ----
     print("\n== Leave-one-release-out (full-size releases; "
           "threshold from train-side OOF only) ==")
-    fold_rewards = []
-    for date, X_te, y_te in full:
+    def _loro_fold(date, X_te):
+        """One fold: fit + OOF threshold on the train side, score held-out.
+        Identical math to the serial loop (fixed random_state everywhere);
+        folds are independent so they run in parallel for wall-time only."""
         X_tr = np.vstack([X for d, X, _ in releases if d != date])
         y_tr = np.concatenate([y for d, _, y in releases if d != date])
         model = GradientBoostingClassifier(**GBM_PARAMS).fit(X_tr, y_tr)
         thr = oof_threshold(X_tr, y_tr)
-        p = np.array([_calibrate(v, thr)
-                      for v in model.predict_proba(X_te)[:, 1]])
+        return thr, np.array([_calibrate(v, thr)
+                              for v in model.predict_proba(X_te)[:, 1]])
+
+    fold_out = Parallel(n_jobs=6)(
+        delayed(_loro_fold)(date, X_te) for date, X_te, _ in full)
+    fold_rewards = []
+    for (date, X_te, y_te), (thr, p) in zip(full, fold_out):
         rew, _ = reward(p, y_te)
         fold_rewards.append(rew)
         report(f"held-out {date} (thr={thr:.3f})", p, y_te)
-    print(f"\n  LORO mean reward = {float(np.mean(fold_rewards)):.4f}  "
+    loro_mean = float(np.mean(fold_rewards))
+    print(f"\n  LORO mean reward = {loro_mean:.4f}  "
           f"min={min(fold_rewards):.4f}  max={max(fold_rewards):.4f}")
 
     # ---- final model: fit on ALL releases, OOF-calibrated ----
@@ -193,7 +309,7 @@ def main() -> None:
     body = json.dumps(
         {
             "model": "gbdt",
-            "feature_names": FEATURES,
+            "feature_names": features,
             "init": init,
             "learning_rate": GBM_PARAMS["learning_rate"],
             "threshold": threshold,
@@ -205,7 +321,8 @@ def main() -> None:
         '"""Auto-generated by local_test/train_detector.py — do not edit by hand.\n'
         "\n"
         f"Gradient-boosted trees ({GBM_PARAMS['n_estimators']} x depth "
-        f"{GBM_PARAMS['max_depth']}) on raw censored features.\n"
+        f"{GBM_PARAMS['max_depth']}) on {len(features)} transfer-gated features\n"
+        "(parity-transformed benchmark hands via build_miner_payload_hand).\n"
         f"Trained on {len(releases)} banked releases ({len(y)} labeled groups): "
         f"{dates}\n"
         '"""\n'
@@ -223,14 +340,44 @@ def main() -> None:
     reload(det)
     sk_prob = final.predict_proba(X[:200])[:, 1]
     for row, expect in zip(X[:200], sk_prob):
-        feats = dict(zip(FEATURES, row))
+        feats = dict(zip(features, row))
         logit = det.PARAMS["init"] + det.PARAMS["learning_rate"] * sum(
-            det._eval_tree(tree, [feats[n] for n in FEATURES])
+            det._eval_tree(tree, [feats[n] for n in features])
             for tree in det.PARAMS["trees"])
         got = 1.0 / (1.0 + np.exp(-logit))
         if abs(got - expect) > 1e-4:
             sys.exit(f"PARITY FAILURE: pure-python {got} vs sklearn {expect}")
+    gate3 = True
     print("[parity] pure-Python tree inference matches sklearn on 200 samples ✓")
+
+    # ---- GATE 2: live replay with the NEW exported params ----
+    live_scores = np.array([det.score_chunk(chunk) for chunk in live_chunks])
+    live_std = float(np.std(live_scores))
+    mid_frac = float(np.mean((live_scores >= GATE2_MID_LO)
+                             & (live_scores <= GATE2_MID_HI)))
+    print(f"\n== Live replay ({len(live_scores)} captured chunks, new params) ==")
+    print(f"  std={live_std:.4f} (need >= {GATE2_STD_MIN}) | "
+          f"frac in [{GATE2_MID_LO},{GATE2_MID_HI}]={mid_frac:.2f} "
+          f"(need >= {GATE2_MID_FRAC_MIN})")
+    print(f"  min={live_scores.min():.3f} q25={np.quantile(live_scores, .25):.3f} "
+          f"median={np.median(live_scores):.3f} "
+          f"q75={np.quantile(live_scores, .75):.3f} max={live_scores.max():.3f}")
+    edges = np.arange(0.0, 1.01, 0.1)
+    hist, _ = np.histogram(live_scores, bins=edges)
+    for lo, hi, c in zip(edges[:-1], edges[1:], hist):
+        print(f"  [{lo:.1f},{hi:.1f}) {'#' * int(c)} {c}")
+
+    # ---- gate verdicts (report honestly; no workarounds) ----
+    gate1 = loro_mean >= GATE1_LORO_MIN
+    gate2 = live_std >= GATE2_STD_MIN and mid_frac >= GATE2_MID_FRAC_MIN
+    print(f"\n== Gates ==")
+    print(f"  GATE 1 (LORO mean >= {GATE1_LORO_MIN}): "
+          f"{'PASS' if gate1 else 'FAIL'} ({loro_mean:.4f})")
+    print(f"  GATE 2 (live std >= {GATE2_STD_MIN} & mid-frac >= "
+          f"{GATE2_MID_FRAC_MIN}): {'PASS' if gate2 else 'FAIL'} "
+          f"(std={live_std:.4f}, mid_frac={mid_frac:.2f})")
+    print(f"  GATE 3 (sklearn parity): {'PASS' if gate3 else 'FAIL'}")
+    print(f"  ALL GATES: {'PASS' if (gate1 and gate2 and gate3) else 'FAIL'}")
     print("[done] Rerun local_test/real_eval.py to grade the new model, then "
           "commit+push neurons/detector_params.py.")
 

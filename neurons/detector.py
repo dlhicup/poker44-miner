@@ -62,6 +62,139 @@ def _std(values: List[float]) -> float:
     return math.sqrt(sum((v - mean) ** 2 for v in values) / n)
 
 
+def _quantile(sorted_vals: List[float], q: float) -> float:
+    """Quantile with linear interpolation (numpy default) on pre-sorted values."""
+    n = len(sorted_vals)
+    if n == 1:
+        return sorted_vals[0]
+    pos = q * (n - 1)
+    lo = int(math.floor(pos))
+    hi = min(lo + 1, n - 1)
+    frac = pos - lo
+    return sorted_vals[lo] + frac * (sorted_vals[hi] - sorted_vals[lo])
+
+
+# Aggregation suffixes applied to every per-hand statistic, in fixed order.
+_AGG_SUFFIXES = ("mean", "std", "min", "max", "q10", "q50", "q90")
+
+
+def _aggregate(name: str, values: List[float], out: Dict[str, float]) -> None:
+    """Write the 7 chunk-level aggregates of a per-hand stat into `out`."""
+    if not values:
+        for suffix in _AGG_SUFFIXES:
+            out[f"{name}__{suffix}"] = 0.0
+        return
+    s = sorted(values)
+    n = len(s)
+    out[f"{name}__mean"] = float(sum(s) / n)
+    out[f"{name}__std"] = float(_std(values))
+    out[f"{name}__min"] = float(s[0])
+    out[f"{name}__max"] = float(s[-1])
+    out[f"{name}__q10"] = float(_quantile(s, 0.10))
+    out[f"{name}__q50"] = float(_quantile(s, 0.50))
+    out[f"{name}__q90"] = float(_quantile(s, 0.90))
+
+
+def _norm_entropy(values: List[Any]) -> float:
+    """Normalized Shannon entropy (natural log) over value counts.
+
+    Divided by log(max(2, distinct_count)); 0.0 when <= 1 distinct value.
+    """
+    counter = Counter(values)
+    distinct = len(counter)
+    if distinct <= 1:
+        return 0.0
+    return _shannon(counter) / math.log(max(2, distinct))
+
+
+def _max_run(values: List[Any]) -> int:
+    """Length of the longest run of identical consecutive values."""
+    best = 0
+    run = 0
+    prev = object()
+    for v in values:
+        run = run + 1 if v == prev else 1
+        prev = v
+        best = max(best, run)
+    return best
+
+
+def _parity_hands(chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Chunk-size parity between live (80-100 hands) and benchmark (30-40).
+
+    Size-dependent aggregates (std, quantiles) shift with hand count, so
+    chunks longer than 40 hands are deterministically subsampled to 35 hands
+    evenly spaced by index, always including the last hand (no randomness).
+    Hands with fewer than 5 actions are then dropped: live hands always carry
+    5-8 actions post-censor, while benchmark stragglers below 5 actions
+    create fake dispersion the live side never sees.
+    """
+    hands = chunk
+    n = len(hands)
+    if n > 40:
+        k = 35
+        hands = [hands[(i * (n - 1)) // (k - 1)] for i in range(k)]
+    return [h for h in hands if len(h.get("actions") or []) >= 5]
+
+
+# Per-hand statistics, in the fixed order used to build CANDIDATE_FEATURES.
+_PER_HAND_STATS = (
+    "fold_share",
+    "call_share",
+    "check_share",
+    "bet_share",
+    "raise_share",
+    "aggression_share",
+    "passive_share",
+    "preflop_share",
+    "postflop_share",
+    "action_entropy",
+    "actor_entropy",
+    "street_entropy",
+    "actor_switch_rate",
+    "actor_run_max_share",
+    "action_run_max_share",
+    "unique_actor_share",
+    "player_count",
+    "seat_utilization",
+    "street_count",
+    "hero_action_share",
+    "raise_to_present_share",
+    "call_to_present_share",
+    "nonzero_amount_share",
+)
+
+_CHUNK_LEVEL_FEATURES = (
+    "thr_aggr_ge35",
+    "thr_action_entropy_le35",
+    "thr_actor_entropy_ge75",
+    "sig_action_top_share",
+    "sig_action_unique_share",
+    "sig_actor_top_share",
+    "sig_actor_unique_share",
+    "sig_street_top_share",
+    "sig_street_unique_share",
+)
+
+# Candidate feature names for the trainer's transfer gate: every new
+# aggregate/chunk-level feature plus the scale-free legacy features. The
+# three betsize_* legacy features are EXCLUDED (verified 340x
+# out-of-distribution live vs benchmark).
+CANDIDATE_FEATURES: List[str] = (
+    [f"{stat}__{agg}" for stat in _PER_HAND_STATS for agg in _AGG_SUFFIXES]
+    + list(_CHUNK_LEVEL_FEATURES)
+    + [
+        "flop_fold_rate",
+        "turn_fold_rate",
+        "river_fold_rate",
+        "flop_raise_rate",
+        "frac_hands_reach_flop",
+        "frac_hands_reach_river",
+        "xhand_fold_ratio_std",
+    ]
+)
+
+
 def extract_features(chunk: List[Dict[str, Any]]) -> Dict[str, float]:
     """Chunk-level behavioral features from CENSORED hands.
 
@@ -69,8 +202,12 @@ def extract_features(chunk: List[Dict[str, Any]]) -> Dict[str, float]:
     local_test/train_detector.py (which imports this function), so the
     deployed model always sees the exact feature definitions it was
     trained on.
+
+    Chunk-size parity is applied first (see _parity_hands); every feature
+    is computed on the resulting hand list.
     """
-    n_hands = len(chunk)
+    hands = _parity_hands(chunk)
+    n_hands = len(hands)
     street_tot: Counter = Counter()
     street_fold: Counter = Counter()
     street_raise: Counter = Counter()
@@ -78,7 +215,12 @@ def extract_features(chunk: List[Dict[str, Any]]) -> Dict[str, float]:
     fold_fracs: List[float] = []
     reach: Counter = Counter()
 
-    for hand in chunk:
+    per_hand: Dict[str, List[float]] = {stat: [] for stat in _PER_HAND_STATS}
+    sig_action: Counter = Counter()
+    sig_actor: Counter = Counter()
+    sig_street: Counter = Counter()
+
+    for hand in hands:
         actions = hand.get("actions") or []
         streets = {
             str(s.get("street", "")).lower() for s in (hand.get("streets") or [])
@@ -103,9 +245,73 @@ def extract_features(chunk: List[Dict[str, Any]]) -> Dict[str, float]:
         if n_actions > 0:
             fold_fracs.append(folds / n_actions)
 
+        # ---- per-hand statistics -----------------------------------------
+        action_types = [a.get("action_type") for a in actions]
+        actor_seats = [a.get("actor_seat") for a in actions]
+        action_streets = [str(a.get("street", "")).lower() for a in actions]
+        type_counts = Counter(action_types)
+
+        meaningful = max(
+            1,
+            sum(type_counts[t] for t in ("call", "check", "bet", "raise", "fold")),
+        )
+        n_all = max(1, n_actions)
+        players = hand.get("players") or []
+        metadata = hand.get("metadata") or {}
+        player_count = len(players)
+        hero_seat = metadata.get("hero_seat")
+
+        per_hand["fold_share"].append(type_counts["fold"] / meaningful)
+        per_hand["call_share"].append(type_counts["call"] / meaningful)
+        per_hand["check_share"].append(type_counts["check"] / meaningful)
+        per_hand["bet_share"].append(type_counts["bet"] / meaningful)
+        per_hand["raise_share"].append(type_counts["raise"] / meaningful)
+        per_hand["aggression_share"].append(
+            (type_counts["bet"] + type_counts["raise"]) / meaningful
+        )
+        per_hand["passive_share"].append(
+            (type_counts["call"] + type_counts["check"]) / meaningful
+        )
+        n_preflop = sum(1 for s in action_streets if s == "preflop")
+        per_hand["preflop_share"].append(n_preflop / n_all)
+        per_hand["postflop_share"].append((n_actions - n_preflop) / n_all)
+        per_hand["action_entropy"].append(_norm_entropy(action_types))
+        per_hand["actor_entropy"].append(_norm_entropy(actor_seats))
+        per_hand["street_entropy"].append(_norm_entropy(action_streets))
+        per_hand["actor_switch_rate"].append(
+            sum(1 for j in range(1, n_actions) if actor_seats[j] != actor_seats[j - 1])
+            / max(1, n_actions - 1)
+        )
+        per_hand["actor_run_max_share"].append(_max_run(actor_seats) / n_all)
+        per_hand["action_run_max_share"].append(_max_run(action_types) / n_all)
+        per_hand["unique_actor_share"].append(
+            len(set(actor_seats)) / max(1, player_count)
+        )
+        per_hand["player_count"].append(float(player_count))
+        per_hand["seat_utilization"].append(
+            player_count / max(1, metadata.get("max_seats") or 0)
+        )
+        per_hand["street_count"].append(float(len(hand.get("streets") or [])))
+        per_hand["hero_action_share"].append(
+            sum(1 for s in actor_seats if s == hero_seat) / n_all
+        )
+        per_hand["raise_to_present_share"].append(
+            sum(1 for a in actions if a.get("raise_to") is not None) / n_all
+        )
+        per_hand["call_to_present_share"].append(
+            sum(1 for a in actions if a.get("call_to") is not None) / n_all
+        )
+        per_hand["nonzero_amount_share"].append(
+            sum(1 for a in actions if (a.get("amount") or 0) > 0) / n_all
+        )
+
+        sig_action[tuple(action_types)] += 1
+        sig_actor[tuple(actor_seats)] += 1
+        sig_street[tuple(action_streets)] += 1
+
     bet_counter = Counter(bets)
     n_bets = len(bets)
-    return {
+    features: Dict[str, float] = {
         "flop_fold_rate": street_fold["flop"] / max(1, street_tot["flop"]),
         "turn_fold_rate": street_fold["turn"] / max(1, street_tot["turn"]),
         "river_fold_rate": street_fold["river"] / max(1, street_tot["river"]),
@@ -119,6 +325,31 @@ def extract_features(chunk: List[Dict[str, Any]]) -> Dict[str, float]:
         "frac_hands_reach_flop": reach["flop"] / max(1, n_hands),
         "frac_hands_reach_river": reach["river"] / max(1, n_hands),
     }
+
+    for stat in _PER_HAND_STATS:
+        _aggregate(stat, per_hand[stat], features)
+
+    # ---- chunk-level features -------------------------------------------
+    n_h = max(1, n_hands)
+    features["thr_aggr_ge35"] = (
+        sum(1 for v in per_hand["aggression_share"] if v >= 0.35) / n_h
+    )
+    features["thr_action_entropy_le35"] = (
+        sum(1 for v in per_hand["action_entropy"] if v <= 0.35) / n_h
+    )
+    features["thr_actor_entropy_ge75"] = (
+        sum(1 for v in per_hand["actor_entropy"] if v >= 0.75) / n_h
+    )
+    for prefix, counter in (
+        ("sig_action", sig_action),
+        ("sig_actor", sig_actor),
+        ("sig_street", sig_street),
+    ):
+        top = counter.most_common(1)[0][1] if counter else 0
+        features[f"{prefix}_top_share"] = top / n_h
+        features[f"{prefix}_unique_share"] = len(counter) / n_h
+
+    return features
 
 
 def _calibrate(p: float, threshold: float) -> float:
