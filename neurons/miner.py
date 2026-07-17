@@ -48,7 +48,7 @@ class Miner(BaseMinerNeuron):
                 "model_version": "1.0.0",
                 "framework": "python-logistic-dispersion",
                 "license": "MIT",
-                "repo_url": "https://github.com/Poker44/Poker44-subnet",
+                "repo_url": "https://github.com/dlhicup/poker44-miner",
                 "notes": (
                     "Two-sided dispersion (typicality) detector: robust |z| of censored "
                     "behavioral features vs the human center, logistic weights, piecewise "

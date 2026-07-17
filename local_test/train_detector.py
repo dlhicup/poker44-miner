@@ -60,29 +60,50 @@ PARAMS_PATH = REPO / "neurons" / "detector_params.py"
 
 
 def load_all_releases():
-    """Load every banked release: returns list of (date, X, y)."""
+    """Load every banked release: returns list of (date, X, y).
+
+    Featurization (censor + extract) is cached per release in
+    local_test/data/features_<date>.json — releases are immutable, so each
+    one is censored exactly once, ever. The cache stores the FEATURES list
+    it was built with and is invalidated automatically if features change.
+    """
     paths = sorted(DATA_DIR.glob("release_*.json"))
     if len(paths) < 2:
         sys.exit(
             f"Need at least 2 banked releases in {DATA_DIR} for honest "
             f"validation; found {len(paths)}. Run local_test/real_eval.py "
-            "on more days first."
+            "on more days first (or local_test/backfill_releases.py for history)."
         )
     releases = []
     for path in paths:
-        with open(path) as fh:
-            data = json.load(fh)
-        date = data.get("source_date", path.stem.replace("release_", ""))
-        labels = np.asarray(data["labels"], dtype=int)
-        X = []
-        for grp in data["groups"]:
-            censored = [prepare_hand_for_miner(h) for h in grp]
-            feats = extract_features(censored)
-            X.append([feats[k] for k in FEATURES])
-        X = np.asarray(X, dtype=float)
-        print(f"[{date}] {len(labels)} groups | humans={int((labels == 0).sum())} "
-              f"bots={int(labels.sum())}")
-        releases.append((date, X, labels))
+        date = path.stem.replace("release_", "")
+        cache_path = DATA_DIR / f"features_{date}.json"
+        X = y = None
+        if cache_path.exists():
+            try:
+                with open(cache_path) as fh:
+                    cached = json.load(fh)
+                if cached.get("features") == FEATURES:
+                    X = np.asarray(cached["X"], dtype=float)
+                    y = np.asarray(cached["y"], dtype=int)
+            except Exception:
+                X = y = None  # unreadable cache -> refeaturize
+        if X is None:
+            with open(path) as fh:
+                data = json.load(fh)
+            y = np.asarray(data["labels"], dtype=int)
+            rows = []
+            for grp in data["groups"]:
+                censored = [prepare_hand_for_miner(h) for h in grp]
+                feats = extract_features(censored)
+                rows.append([feats[k] for k in FEATURES])
+            X = np.asarray(rows, dtype=float)
+            with open(cache_path, "w") as fh:
+                json.dump({"features": FEATURES, "X": X.tolist(),
+                           "y": y.tolist()}, fh)
+        print(f"[{date}] {len(y)} groups | humans={int((y == 0).sum())} "
+              f"bots={int(y.sum())}")
+        releases.append((date, X, y))
     return releases
 
 
@@ -133,16 +154,17 @@ def main() -> None:
     best_c, best_rew, best_run = None, -1.0, None
     for C in (0.1, 0.3, 1.0, 3.0):
         oos_pred, oos_y, per_release = leave_one_release_out(releases, C)
-        mean_rew = float(np.mean([r for _, r, _, _ in per_release]))
-        detail = "  ".join(f"{d}={r:.4f}" for d, r, _, _ in per_release)
-        print(f"  C={C:<4}: mean={mean_rew:.4f}  ({detail})")
+        rews = [r for _, r, _, _ in per_release]
+        mean_rew = float(np.mean(rews))
+        print(f"  C={C:<4}: mean={mean_rew:.4f}  "
+              f"min={min(rews):.4f}  max={max(rews):.4f}  (n={len(rews)} folds)")
         if mean_rew > best_rew:
             best_c, best_rew = C, mean_rew
             best_run = (oos_pred, oos_y, per_release)
     print(f"  -> selected C={best_c} (mean out-of-sample reward {best_rew:.4f})")
 
     oos_pred, oos_y, per_release = best_run
-    print("\n== Out-of-sample detail at selected C (pre-calibration) ==")
+    print("\n== Out-of-sample per-release detail at selected C (pre-calibration) ==")
     for date, _, p, y in per_release:
         report(f"held-out {date}", p, y)
 
