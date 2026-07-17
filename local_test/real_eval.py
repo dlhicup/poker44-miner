@@ -8,10 +8,12 @@ labeled poker hands (humans AND bots) from the public benchmark API:
     https://api.poker44.net/api/v1/benchmark      (no auth, no key)
 
 Flow (identical to production grading, minus the blockchain):
-    real chunk groups (with real 1=bot/0=human labels)
-      -> prepare_hand_for_miner()   (the exact validator censor)
+    real chunk groups (with real 1=bot/0=human labels), AS-DELIVERED
       -> MODEL: one risk score per chunk group
       -> reward(y_pred, y_true)      (the exact validator metric)
+
+The API's groups are ALREADY the validator's miner-visible payload, so they
+are fed to the model untouched — exactly what a validator sends over the wire.
 
 Run:
     cd /home/client_7075_3/Projects/Poker44-subnet
@@ -25,9 +27,8 @@ import sys
 
 # Reuse everything already built and verified in local_eval.py.
 from local_test.local_eval import (
-    prepare_hand_for_miner,  # the production censor
-    MODEL,                   # the model under test (reference heuristic by default)
-    grade,                   # exact validator grading (reward once over all chunks)
+    MODEL,   # the model under test (your detector via your_model_score_chunk)
+    grade,   # exact validator grading (reward once over all chunks)
 )
 
 BASE = "https://api.poker44.net/api/v1/benchmark"
@@ -97,9 +98,11 @@ def main() -> None:
     print(f"[data] {len(raw_groups)} real chunk groups | "
           f"humans(0)={labels.count(0)}  bots(1)={labels.count(1)}")
 
-    # Censor every hand exactly as the validator does, then score per group.
-    censored = [[prepare_hand_for_miner(h) for h in grp] for grp in raw_groups]
-    y_pred = [MODEL(grp) for grp in censored]
+    # Score each group AS-DELIVERED. The benchmark API already returns the
+    # validator's miner-visible payload (prepare_hand_for_miner applied
+    # upstream), so re-censoring here would re-bucket/re-noise bet sizes and
+    # re-sample the action window -> a distribution production never sends.
+    y_pred = [MODEL(grp) for grp in raw_groups]
 
     rew, metrics, impl = grade(y_pred, labels)
 

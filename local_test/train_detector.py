@@ -40,9 +40,13 @@ sys.path.insert(0, str(REPO))
 
 from neurons.detector import extract_features, _calibrate  # noqa: E402
 from poker44.score.scoring import reward  # noqa: E402
-from poker44.validator.payload_view import prepare_hand_for_miner  # noqa: E402
 
 DATA_DIR = REPO / "local_test" / "data"
+# Bumped whenever the featurisation input changes; stale caches are ignored.
+# v2: benchmark groups are fed AS-DELIVERED (they are already the validator's
+# miner-visible payload). v1 wrongly ran prepare_hand_for_miner over them a
+# second time, training the model on a distribution production never sends.
+CACHE_VERSION = 2
 FEATURES = [
     "flop_fold_rate",
     "turn_fold_rate",
@@ -69,7 +73,15 @@ PARAMS_PATH = REPO / "neurons" / "detector_params.py"
 
 def load_all_releases():
     """Load every banked release: list of (date, X, y). Feature caching:
-    each immutable release is censored+featurized once, ever."""
+    each immutable release is featurized once per CACHE_VERSION.
+
+    Groups are featurized AS-DELIVERED. The benchmark API already returns the
+    validator's miner-visible payload (seat_N aliases, hole_cards=None, empty
+    board, zeroed outcome, sb/bb=0.01/0.02), i.e. prepare_hand_for_miner has
+    already been applied upstream. Running it again re-buckets and re-noises
+    bet sizes and re-samples the action window, producing features that
+    production never sends.
+    """
     paths = sorted(DATA_DIR.glob("release_*.json"))
     if len(paths) < 2:
         sys.exit(f"Need >=2 banked releases in {DATA_DIR}; found {len(paths)}.")
@@ -82,7 +94,8 @@ def load_all_releases():
             try:
                 with open(cache_path) as fh:
                     cached = json.load(fh)
-                if cached.get("features") == FEATURES:
+                if (cached.get("features") == FEATURES
+                        and cached.get("cache_version") == CACHE_VERSION):
                     X = np.asarray(cached["X"], dtype=float)
                     y = np.asarray(cached["y"], dtype=int)
             except Exception:
@@ -93,12 +106,12 @@ def load_all_releases():
             y = np.asarray(data["labels"], dtype=int)
             rows = []
             for grp in data["groups"]:
-                censored = [prepare_hand_for_miner(h) for h in grp]
-                feats = extract_features(censored)
+                feats = extract_features(grp)
                 rows.append([feats[k] for k in FEATURES])
             X = np.asarray(rows, dtype=float)
             with open(cache_path, "w") as fh:
-                json.dump({"features": FEATURES, "X": X.tolist(), "y": y.tolist()}, fh)
+                json.dump({"features": FEATURES, "cache_version": CACHE_VERSION,
+                           "X": X.tolist(), "y": y.tolist()}, fh)
         releases.append((date, X, y))
     return releases
 

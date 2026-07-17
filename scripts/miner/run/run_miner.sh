@@ -10,6 +10,8 @@ MINER_SCRIPT="${MINER_SCRIPT:-./neurons/miner.py}"
 PM2_NAME="${PM2_NAME:-poker44_miner}"  ##  name of Miner, as you wish
 AXON_PORT="${AXON_PORT:-8091}"
 ALLOWED_VALIDATOR_HOTKEYS="${ALLOWED_VALIDATOR_HOTKEYS:-}"
+# Use the project venv's python (has bittensor); override with PYTHON_BIN.
+PYTHON_BIN="${PYTHON_BIN:-$(pwd)/.venv/bin/python}"
 
 if [ ! -f "$MINER_SCRIPT" ]; then
     echo "Error: Miner script not found at $MINER_SCRIPT"
@@ -24,6 +26,12 @@ fi
 pm2 delete $PM2_NAME 2>/dev/null || true
 
 export PYTHONPATH="$(pwd)"
+# bittensor >= 10 disables CLI arg parsing unless this is set; without it the
+# neuron gets a default config (no netuid/wallet/neuron.*) and crashes.
+export BT_NO_PARSE_CLI_ARGS=false
+# Stamp the manifest with the commit actually being served (compliance:
+# manifest repo_commit must match the public repo).
+export POKER44_MODEL_REPO_COMMIT="${POKER44_MODEL_REPO_COMMIT:-$(git rev-parse HEAD 2>/dev/null)}"
 
 MINER_ARGS=(
   --netuid "$NETUID"
@@ -42,7 +50,8 @@ else
 fi
 
 pm2 start $MINER_SCRIPT \
-  --name $PM2_NAME -- \
+  --name $PM2_NAME \
+  --interpreter "$PYTHON_BIN" -- \
   "${MINER_ARGS[@]}"
 
 pm2 save
