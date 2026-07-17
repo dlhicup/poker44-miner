@@ -1,14 +1,14 @@
-"""Reference Poker44 miner with simple chunk-level behavioral heuristics."""
+"""Poker44 miner — dispersion-based bot detector (see neurons/detector.py)."""
 
 # from __future__ import annotations
 
 import time
-from collections import Counter
 from pathlib import Path
 from typing import Tuple
 
 import bittensor as bt
 
+from neurons.detector import score_chunk as detector_score_chunk
 from poker44.base.miner import BaseMinerNeuron
 from poker44.utils.model_manifest import (
     build_local_model_manifest,
@@ -20,35 +20,52 @@ from poker44.validator.synapse import DetectionSynapse
 
 class Miner(BaseMinerNeuron):
     """
-    Reference heuristic miner.
+    Dispersion-detector miner.
 
-    It aggregates simple behavior signals over each chunk and returns a bot-risk
-    score per chunk. The goal is not SOTA accuracy, but a deterministic and
-    explainable baseline that is meaningfully better than random.
+    Scores each chunk with a typicality model: bots on this subnet are not
+    shifted from humans on any single behavioral statistic, but every bot
+    family is an outlier from the human center in its own direction. The
+    model (neurons/detector.py) measures two-sided robust deviations on
+    censored behavioral features and combines them with logistic-regression
+    weights trained on the public benchmark releases, calibrated so the
+    bot/human decision boundary sits at 0.5.
     """
 
     def __init__(self, config=None):
         super(Miner, self).__init__(config=config)
         bt.logging.info("🤖 Heuristic Poker44 Miner started")
         repo_root = Path(__file__).resolve().parents[1]
+        neurons_dir = Path(__file__).resolve().parent
         self.model_manifest = build_local_model_manifest(
             repo_root=repo_root,
-            implementation_files=[Path(__file__).resolve()],
+            implementation_files=[
+                Path(__file__).resolve(),
+                neurons_dir / "detector.py",
+                neurons_dir / "detector_params.py",
+            ],
             defaults={
-                "model_name": "poker44-reference-heuristic",
-                "model_version": "1",
-                "framework": "python-heuristic",
+                "model_name": "poker44-dispersion-detector",
+                "model_version": "1.0.0",
+                "framework": "python-logistic-dispersion",
                 "license": "MIT",
                 "repo_url": "https://github.com/Poker44/Poker44-subnet",
-                "notes": "Reference heuristic miner shipped with the Poker44 subnet.",
+                "notes": (
+                    "Two-sided dispersion (typicality) detector: robust |z| of censored "
+                    "behavioral features vs the human center, logistic weights, piecewise "
+                    "calibration at 0.5. Trained offline via local_test/train_detector.py."
+                ),
                 "open_source": True,
                 "inference_mode": "remote",
                 "training_data_statement": (
-                    "Reference heuristic miner. No training step. Uses only runtime chunk features."
+                    "Trained exclusively on the public Poker44 benchmark API releases "
+                    "2026-07-15 and 2026-07-16 (labeled chunk groups, validator-censored "
+                    "payload view). No validator-only evaluation data used."
                 ),
-                "training_data_sources": ["none"],
+                "training_data_sources": [
+                    "https://api.poker44.net/api/v1/benchmark (releases 2026-07-15, 2026-07-16)"
+                ],
                 "private_data_attestation": (
-                    "This reference miner does not train on validator-only evaluation data."
+                    "This miner does not train on validator-only evaluation data."
                 ),
             },
         )
@@ -100,56 +117,9 @@ class Miner(BaseMinerNeuron):
         return synapse
 
     @staticmethod
-    def _clamp01(value: float) -> float:
-        return max(0.0, min(1.0, value))
-
-    @classmethod
-    def _score_hand(cls, hand: dict) -> float:
-        actions = hand.get("actions") or []
-        players = hand.get("players") or []
-        streets = hand.get("streets") or []
-        outcome = hand.get("outcome") or {}
-
-        action_counts = Counter(action.get("action_type") for action in actions)
-        meaningful_actions = max(
-            1,
-            sum(
-                action_counts.get(kind, 0)
-                for kind in ("call", "check", "bet", "raise", "fold")
-            ),
-        )
-
-        call_ratio = action_counts.get("call", 0) / meaningful_actions
-        check_ratio = action_counts.get("check", 0) / meaningful_actions
-        fold_ratio = action_counts.get("fold", 0) / meaningful_actions
-        raise_ratio = action_counts.get("raise", 0) / meaningful_actions
-        street_depth = len(streets) / 3.0
-        showdown_flag = 1.0 if outcome.get("showdown") else 0.0
-
-        player_count_signal = 0.0
-        if players:
-            player_count_signal = (6 - min(len(players), 6)) / 4.0
-
-        score = 0.0
-        score += 0.32 * street_depth
-        score += 0.22 * showdown_flag
-        score += 0.18 * cls._clamp01(call_ratio / 0.35)
-        score += 0.12 * cls._clamp01(check_ratio / 0.30)
-        score += 0.08 * cls._clamp01(player_count_signal)
-        score -= 0.18 * cls._clamp01(fold_ratio / 0.55)
-        score -= 0.10 * cls._clamp01(raise_ratio / 0.20)
-
-        return cls._clamp01(score)
-
-    @classmethod
-    def score_chunk(cls, chunk: list[dict]) -> float:
-        if not chunk:
-            return 0.5
-
-        hand_scores = [cls._score_hand(hand) for hand in chunk]
-        avg_score = sum(hand_scores) / len(hand_scores)
-
-        return round(cls._clamp01(avg_score), 6)
+    def score_chunk(chunk: list[dict]) -> float:
+        """Delegate to the trained dispersion detector (neurons/detector.py)."""
+        return detector_score_chunk(chunk)
 
     async def blacklist(self, synapse: DetectionSynapse) -> Tuple[bool, str]:
         """Determine whether to blacklist incoming requests."""
