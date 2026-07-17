@@ -31,7 +31,10 @@ export PYTHONPATH="$(pwd)"
 export BT_NO_PARSE_CLI_ARGS=false
 # Stamp the manifest with the commit actually being served (compliance:
 # manifest repo_commit must match the public repo).
-export POKER44_MODEL_REPO_COMMIT="${POKER44_MODEL_REPO_COMMIT:-$(git rev-parse HEAD 2>/dev/null)}"
+# Unconditional on purpose: git HEAD is the ONLY source of truth here. A
+# ":-" fallback would let a stale exported value survive across restarts and
+# make the manifest claim a commit that no longer matches the served model.
+export POKER44_MODEL_REPO_COMMIT="$(git rev-parse HEAD 2>/dev/null)"
 
 MINER_ARGS=(
   --netuid "$NETUID"

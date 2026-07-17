@@ -215,3 +215,4 @@ wandb/
 local_test/data/
 local_test/logs/
 *.pdf
+local_test/captures/
