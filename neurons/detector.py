@@ -31,6 +31,7 @@ local_test/train_detector.py; regenerate by rerunning that script).
 from __future__ import annotations
 
 import math
+import struct
 from collections import Counter
 from typing import Any, Dict, List
 
@@ -133,16 +134,51 @@ def _calibrate(p: float, threshold: float) -> float:
     return 0.5 + 0.5 * (p - t) / (1.0 - t)
 
 
+def _f32(value: float) -> float:
+    """Round-trip through IEEE float32 — sklearn casts inputs to float32
+    before threshold comparison, and parity requires emulating that."""
+    return struct.unpack("f", struct.pack("f", value))[0]
+
+
+def _eval_tree(tree: Dict[str, List[float]], x: List[float]) -> float:
+    """Walk one exported decision tree to its leaf value.
+
+    Flat-array encoding (sklearn layout): f[i] = split feature index
+    (-2 for a leaf), t[i] = threshold, l[i]/r[i] = child node indices,
+    v[i] = leaf value. Comparison is float32(x) <= float64(threshold),
+    exactly as sklearn evaluates it.
+    """
+    f, t, l, r, v = tree["f"], tree["t"], tree["l"], tree["r"], tree["v"]
+    i = 0
+    while f[i] >= 0:
+        i = l[i] if _f32(x[f[i]]) <= t[i] else r[i]
+    return v[i]
+
+
 def score_chunk(chunk: List[Dict[str, Any]]) -> float:
     """One bot-risk score in [0, 1] for a chunk of censored hands."""
     if not chunk or PARAMS is None:
         return _NEUTRAL_SCORE
 
     features = extract_features(chunk)
-    logit = PARAMS["bias"]
-    for name, center, scale, weight in PARAMS["features"]:
-        z = abs(features[name] - center) / scale
-        logit += weight * z
+
+    if PARAMS.get("model") == "gbdt":
+        # Gradient-boosted trees on RAW feature values. Trees natively learn
+        # two-sided splits where dispersion matters AND keep the directional
+        # signal of the near-human bot family (a two-sided |z| transform
+        # destroys the sign and made that family invisible — see forensics).
+        x = [features[name] for name in PARAMS["feature_names"]]
+        logit = PARAMS["init"]
+        rate = PARAMS["learning_rate"]
+        for tree in PARAMS["trees"]:
+            logit += rate * _eval_tree(tree, x)
+    else:
+        # Legacy linear form: two-sided robust |z| -> logistic weights.
+        logit = PARAMS["bias"]
+        for name, center, scale, weight in PARAMS["features"]:
+            z = abs(features[name] - center) / scale
+            logit += weight * z
+
     probability = 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, logit))))
     calibrated = _calibrate(probability, PARAMS["threshold"])
     return round(min(0.999, max(0.001, calibrated)), 6)
