@@ -46,16 +46,21 @@ DATA_DIR = REPO / "local_test" / "data"
 # v2: benchmark groups are fed AS-DELIVERED (they are already the validator's
 # miner-visible payload). v1 wrongly ran prepare_hand_for_miner over them a
 # second time, training the model on a distribution production never sends.
-CACHE_VERSION = 2
+CACHE_VERSION = 3
+# Only features whose PRODUCTION distribution matches the benchmark training
+# distribution (verified against a captured live validator payload). The four
+# dropped features were the model's strongest on the synthetic benchmark but
+# are catastrophically out-of-distribution live: real hands bet ~1-2bb in tight
+# standard sizes, while the synthetic benchmark bots bet 8-190bb wildly, so
+# betsize_std_bb (0.14 live vs ~48 train), betsize_entropy_norm,
+# betsize_frac_unique and xhand_fold_ratio_std all collapsed and saturated
+# every live score to ~0.98 (all-True). No rescaling (CV, bet/pot) transfers
+# either. What's left are scale-free per-street rates and reach fractions.
 FEATURES = [
     "flop_fold_rate",
     "turn_fold_rate",
     "river_fold_rate",
     "flop_raise_rate",
-    "xhand_fold_ratio_std",
-    "betsize_std_bb",
-    "betsize_entropy_norm",
-    "betsize_frac_unique",
     "frac_hands_reach_flop",
     "frac_hands_reach_river",
 ]
