@@ -447,6 +447,33 @@ def _eval_tree(tree: Dict[str, List[float]], x: List[float]) -> float:
     return v[i]
 
 
+def percentile_ranks(values: List[float]) -> List[float]:
+    """Tie-averaged percentile ranks in [0, 1].
+
+    The reference implementation for the request-relative rank branch: the
+    trainer imports THIS function for the training-time transform, so train
+    and serve are identical by construction. n == 1 -> [0.5]; ties share the
+    mean of their positional ranks; result divided by (n - 1).
+    """
+    n = len(values)
+    if n == 0:
+        return []
+    if n == 1:
+        return [0.5]
+    order = sorted(range(n), key=lambda i: (values[i], i))
+    ranks = [0.0] * n
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and values[order[j + 1]] == values[order[i]]:
+            j += 1
+        avg = (i + j) / 2.0
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg / (n - 1)
+        i = j + 1
+    return ranks
+
+
 def _sigmoid(logit: float) -> float:
     return 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, logit))))
 
@@ -469,12 +496,84 @@ def _member_probability(member: Dict[str, Any], x: List[float]) -> float:
     return total / max(1, len(member["trees"]))
 
 
+def _members_probability(members: List[Dict[str, Any]], x: List[float]) -> float:
+    """Weighted probability from a list of exported ensemble members."""
+    return sum(m["weight"] * _member_probability(m, x) for m in members)
+
+
+def score_chunks_batch(chunks: List[List[Dict[str, Any]]]) -> List[float]:
+    """Score a whole validator request at once (the production path).
+
+    With a rank_blend model this blends two branches per chunk:
+      raw branch  — the usual model on absolute feature values;
+      rank branch — the same architecture on each feature's tie-averaged
+                    percentile rank WITHIN THIS REQUEST, which is immune to
+                    benchmark->live scale drift by construction (a chunk at
+                    the 80th percentile of its batch is at the 80th
+                    percentile in any data distribution).
+    Falls back to per-chunk raw scoring for small batches (< 8 chunks, where
+    within-request ranks are meaningless) or non-rank_blend params. A chunk
+    whose feature extraction fails gets _NEUTRAL_SCORE and is excluded from
+    the rank transform; the reply length always equals len(chunks).
+    """
+    if not chunks or PARAMS is None:
+        return [_NEUTRAL_SCORE] * len(chunks)
+    if PARAMS.get("model") != "rank_blend" or len(chunks) < 8:
+        return [score_chunk(c) for c in chunks]
+
+    names = PARAMS["feature_names"]
+    rows: List[Any] = []
+    for chunk in chunks:
+        try:
+            feats = extract_features(chunk)
+            rows.append([feats[n] for n in names])
+        except Exception:
+            rows.append(None)
+    valid = [i for i, r in enumerate(rows) if r is not None]
+
+    raw_p: Dict[int, float] = {
+        i: _members_probability(PARAMS["raw_members"], rows[i]) for i in valid
+    }
+    rank_p: Dict[int, float] = {}
+    if len(valid) >= 8:
+        cols = list(zip(*[rows[i] for i in valid]))
+        ranked = [percentile_ranks(list(col)) for col in cols]
+        for pos, i in enumerate(valid):
+            x_rank = [ranked[j][pos] for j in range(len(names))]
+            rank_p[i] = _members_probability(PARAMS["rank_members"], x_rank)
+
+    w = PARAMS["w_raw"]
+    out: List[float] = []
+    for i in range(len(chunks)):
+        if rows[i] is None:
+            out.append(_NEUTRAL_SCORE)
+            continue
+        p = raw_p[i]
+        if i in rank_p:
+            p = w * p + (1.0 - w) * rank_p[i]
+        out.append(
+            round(min(0.999, max(0.001, _calibrate(p, PARAMS["threshold"]))), 6)
+        )
+    return out
+
+
 def score_chunk(chunk: List[Dict[str, Any]]) -> float:
-    """One bot-risk score in [0, 1] for a chunk of censored hands."""
+    """One bot-risk score in [0, 1] for a chunk of censored hands.
+
+    Single-chunk path: with a rank_blend model this uses the RAW branch only
+    (a within-request rank needs the rest of the request — see
+    score_chunks_batch, which is what the miner serves with).
+    """
     if not chunk or PARAMS is None:
         return _NEUTRAL_SCORE
 
     features = extract_features(chunk)
+
+    if PARAMS.get("model") == "rank_blend":
+        x = [features[name] for name in PARAMS["feature_names"]]
+        probability = _members_probability(PARAMS["raw_members"], x)
+        calibrated = _calibrate(probability, PARAMS["threshold"])
+        return round(min(0.999, max(0.001, calibrated)), 6)
 
     if PARAMS.get("model") == "ensemble":
         # Weighted blend of heterogeneous tree families (GBDT + ExtraTrees +

@@ -44,7 +44,12 @@ from sklearn.model_selection import StratifiedKFold
 REPO = Path("/home/client_7075_3/Projects/Poker44-subnet")
 sys.path.insert(0, str(REPO))
 
-from neurons.detector import CANDIDATE_FEATURES, extract_features, _calibrate  # noqa: E402
+from neurons.detector import (  # noqa: E402
+    CANDIDATE_FEATURES,
+    extract_features,
+    percentile_ranks,
+    _calibrate,
+)
 from poker44.score.scoring import reward  # noqa: E402
 from poker44.validator.payload_view import build_miner_payload_hand  # noqa: E402
 
@@ -81,6 +86,10 @@ BLEND_GRID = [
     for a in range(11)
     for b in range(11 - a)
 ]
+# Raw-vs-rank branch blend grid. The rank-branch experiment showed a smooth
+# plateau (every w in 0.4-0.8 beat both single branches), so a coarse grid is
+# enough and less overfit-prone.
+W_RAW_GRID = (0.3, 0.4, 0.5, 0.6, 0.7)
 PARAMS_PATH = REPO / "neurons" / "detector_params.py"
 
 # Gate acceptance criteria (reported honestly; no workarounds if they fail).
@@ -285,6 +294,40 @@ def _blend_probs(models: dict, weights: dict, X: np.ndarray) -> np.ndarray:
     )
 
 
+def _rank_matrix(X: np.ndarray) -> np.ndarray:
+    """Within-group percentile-rank transform, one column at a time, using the
+    SAME pure-python ranker the miner serves with (imported from
+    neurons.detector) so train and serve match by construction. Applied per
+    RELEASE at training time; the serving analog ranks within the incoming
+    100-chunk request."""
+    cols = [percentile_ranks([float(v) for v in X[:, j]]) for j in range(X.shape[1])]
+    return np.asarray(cols, dtype=float).T
+
+
+def _gb_oof(X: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """5-fold OOF probabilities for a single GBDT (rank-branch helper)."""
+    oof = np.zeros(len(y))
+    for tr, te in StratifiedKFold(5, shuffle=True, random_state=0).split(X, y):
+        model = GradientBoostingClassifier(**GBM_PARAMS).fit(X[tr], y[tr])
+        oof[te] = model.predict_proba(X[te])[:, 1]
+    return oof
+
+
+def _tune_branch_blend(oof_raw: np.ndarray, oof_rank: np.ndarray, y: np.ndarray):
+    """Pick w_raw + threshold on OOF predictions of the two branches,
+    maximizing the authoritative reward. Returns (w_raw, threshold, reward)."""
+    best = (0.5, 0.5, -1.0)
+    for w in W_RAW_GRID:
+        blend = w * oof_raw + (1.0 - w) * oof_rank
+        thr = float(np.quantile(blend[y == 0], 1.0 - TARGET_HUMAN_FPR))
+        thr = min(max(thr, 0.05), 0.95)
+        p = np.array([_calibrate(v, thr) for v in blend])
+        rew, _ = reward(p, y.astype(bool))
+        if rew > best[2]:
+            best = (w, thr, rew)
+    return best
+
+
 def report(tag: str, p: np.ndarray, y: np.ndarray) -> None:
     rew, met = reward(p, y)
     print(f"  {tag}: AUC={roc_auc_score(y, p):.3f} reward={rew:.4f} "
@@ -313,6 +356,9 @@ def main() -> None:
     cols = [CANDIDATE_FEATURES.index(name) for name in features]
     releases = [(d, Xr[:, cols], yr) for d, Xr, yr in releases]
     X_live = X_live[:, cols]
+    # Rank-branch training views: percentile ranks WITHIN each release (the
+    # serving analog ranks within the incoming request).
+    releases_rank = {d: _rank_matrix(Xr) for d, Xr, _ in releases}
 
     full = [(d, X, y) for d, X, y in releases if len(y) >= FULL_SIZE_MIN_GROUPS]
     print(f"[data] {len(full)} full-size validation folds | "
@@ -322,16 +368,28 @@ def main() -> None:
     print("\n== Leave-one-release-out (full-size releases; "
           "threshold from train-side OOF only) ==")
     def _loro_fold(date, X_te):
-        """One fold: fit the 3-member ensemble on the train side, tune blend
-        weights + threshold on train-side OOF only, score the held-out date.
-        Identical math across folds (fixed random_state everywhere); folds
-        are independent so they run in parallel for wall-time only."""
+        """One fold of the full two-branch pipeline, train-side-only tuning:
+        raw ensemble (3 members, OOF-tuned internal weights) + rank-branch
+        GBDT (within-release rank views) + raw/rank blend weight and
+        threshold from train-side OOF. Scores the held-out date exactly as
+        serving would (its rank view computed within itself)."""
         X_tr = np.vstack([X for d, X, _ in releases if d != date])
         y_tr = np.concatenate([y for d, _, y in releases if d != date])
+        X_tr_rank = np.vstack([releases_rank[d] for d, _, _ in releases if d != date])
+        X_te_rank = releases_rank[date]
+
         models = _fit_members(X_tr, y_tr)
-        oof = _oof_member_probs(X_tr, y_tr)
-        weights, thr, _ = _tune_blend(oof, y_tr)
-        blend = _blend_probs(models, weights, X_te)
+        oof_members = _oof_member_probs(X_tr, y_tr)
+        weights, _, _ = _tune_blend(oof_members, y_tr)
+        oof_raw = sum(weights[k] * oof_members[k] for k in ("gb", "et", "rf"))
+
+        rank_model = GradientBoostingClassifier(**GBM_PARAMS).fit(X_tr_rank, y_tr)
+        oof_rank = _gb_oof(X_tr_rank, y_tr)
+
+        w_raw, thr, _ = _tune_branch_blend(oof_raw, oof_rank, y_tr)
+        p_raw = _blend_probs(models, weights, X_te)
+        p_rank = rank_model.predict_proba(X_te_rank)[:, 1]
+        blend = w_raw * p_raw + (1.0 - w_raw) * p_rank
         return thr, np.array([_calibrate(v, thr) for v in blend])
 
     fold_out = Parallel(n_jobs=6)(
@@ -345,14 +403,23 @@ def main() -> None:
     print(f"\n  LORO mean reward = {loro_mean:.4f}  "
           f"min={min(fold_rewards):.4f}  max={max(fold_rewards):.4f}")
 
-    # ---- final ensemble: fit on ALL releases, OOF blend + calibration ----
+    # ---- final two-branch model: fit on ALL releases, OOF-tuned ----
     X = np.vstack([Xr for _, Xr, _ in releases])
     y = np.concatenate([yr for _, _, yr in releases])
+    X_rank = np.vstack([releases_rank[d] for d, _, _ in releases])
+
     final_models = _fit_members(X, y)
     final_oof = _oof_member_probs(X, y)
-    weights, threshold, oof_rew = _tune_blend(final_oof, y)
-    print(f"\n[final] fit on {len(y)} groups | blend weights={weights} "
-          f"| threshold={threshold:.4f} | OOF reward={oof_rew:.4f}")
+    weights, _, _ = _tune_blend(final_oof, y)
+    oof_raw = sum(weights[k] * final_oof[k] for k in ("gb", "et", "rf"))
+
+    final_rank = GradientBoostingClassifier(**GBM_PARAMS).fit(X_rank, y)
+    oof_rank = _gb_oof(X_rank, y)
+
+    w_raw, threshold, oof_rew = _tune_branch_blend(oof_raw, oof_rank, y)
+    print(f"\n[final] fit on {len(y)} groups | raw member weights={weights} "
+          f"| w_raw={w_raw} | threshold={threshold:.4f} "
+          f"| OOF blend reward={oof_rew:.4f}")
 
     # ---- export every member as flat tree arrays (pure-Python inference) ----
     def _export_regression_trees(gbc):
@@ -391,7 +458,7 @@ def main() -> None:
 
     prior = float(np.clip(np.mean(y), 1e-9, 1 - 1e-9))
     init = float(np.log(prior / (1.0 - prior)))
-    members = [
+    raw_members = [
         {
             "kind": "gbdt",
             "weight": weights["gb"],
@@ -411,25 +478,36 @@ def main() -> None:
         },
     ]
     # Drop zero-weight members entirely — smaller file, faster inference.
-    members = [m for m in members if m["weight"] > 0]
+    raw_members = [m for m in raw_members if m["weight"] > 0]
+    rank_members = [
+        {
+            "kind": "gbdt",
+            "weight": 1.0,
+            "init": init,
+            "learning_rate": GBM_PARAMS["learning_rate"],
+            "trees": _export_regression_trees(final_rank),
+        },
+    ]
 
     dates = ", ".join(d for d, _, _ in releases)
     body = json.dumps(
         {
-            "model": "ensemble",
+            "model": "rank_blend",
             "feature_names": features,
             "threshold": threshold,
-            "members": members,
+            "w_raw": w_raw,
+            "raw_members": raw_members,
+            "rank_members": rank_members,
         },
         separators=(",", ":"),
     )
     PARAMS_PATH.write_text(
         '"""Auto-generated by local_test/train_detector.py — do not edit by hand.\n'
         "\n"
-        f"Heterogeneous tree ensemble (GBDT {GBM_PARAMS['n_estimators']}x"
-        f"d{GBM_PARAMS['max_depth']} + ExtraTrees/RandomForest "
-        f"{FOREST_PARAMS['n_estimators']}xd{FOREST_PARAMS['max_depth']}), "
-        f"blend weights {weights},\n"
+        f"Two-branch rank_blend: raw tree ensemble (member weights {weights}) "
+        f"blended w_raw={w_raw}\n"
+        "with a request-relative percentile-rank GBDT branch "
+        "(scale-drift-immune by construction),\n"
         f"on {len(features)} transfer-gated features "
         "(parity-transformed benchmark hands).\n"
         f"Trained on {len(releases)} banked releases ({len(y)} labeled groups): "
@@ -439,31 +517,37 @@ def main() -> None:
         f"PARAMS = _json.loads({body!r})\n"
     )
     size_kb = PARAMS_PATH.stat().st_size / 1024
-    n_trees = sum(len(m["trees"]) for m in members)
+    n_trees = sum(len(m["trees"]) for m in raw_members + rank_members)
     print(f"[write] {PARAMS_PATH} ({size_kb:.0f} KB, {n_trees} trees, "
-          f"{len(members)} members)")
+          f"{len(raw_members)} raw + {len(rank_members)} rank members)")
 
-    # ---- parity check: exported pure-Python ensemble vs sklearn blend ----
+    # ---- parity: exported pure-Python branches vs sklearn ----
     from importlib import reload
     import neurons.detector_params
     import neurons.detector as det
     reload(neurons.detector_params)
     reload(det)
-    sk_blend = _blend_probs(final_models, weights, X[:200])
-    for row, expect in zip(X[:200], sk_blend):
-        x_list = [float(v) for v in row]
-        got = sum(
-            m["weight"] * det._member_probability(m, x_list)
-            for m in det.PARAMS["members"]
+    sk_raw = _blend_probs(final_models, weights, X[:200])
+    for row, expect in zip(X[:200], sk_raw):
+        got = det._members_probability(
+            det.PARAMS["raw_members"], [float(v) for v in row]
         )
         if abs(got - expect) > 1e-4:
-            sys.exit(f"PARITY FAILURE: pure-python {got} vs sklearn {expect}")
+            sys.exit(f"RAW PARITY FAILURE: pure-python {got} vs sklearn {expect}")
+    sk_rank = final_rank.predict_proba(X_rank[:200])[:, 1]
+    for row, expect in zip(X_rank[:200], sk_rank):
+        got = det._members_probability(
+            det.PARAMS["rank_members"], [float(v) for v in row]
+        )
+        if abs(got - expect) > 1e-4:
+            sys.exit(f"RANK PARITY FAILURE: pure-python {got} vs sklearn {expect}")
     gate3 = True
-    print("[parity] pure-Python ensemble inference matches sklearn on "
-          "200 samples ✓")
+    print("[parity] pure-Python raw + rank branch inference matches sklearn "
+          "on 200 samples each ✓")
 
-    # ---- GATE 2: live replay with the NEW exported params ----
-    live_scores = np.array([det.score_chunk(chunk) for chunk in live_chunks])
+    # ---- GATE 2: live replay through the TRUE serving path (batch scorer
+    # with the within-request rank branch) on the captured 100-chunk query ----
+    live_scores = np.array(det.score_chunks_batch(live_chunks))
     live_std = float(np.std(live_scores))
     mid_frac = float(np.mean((live_scores >= GATE2_MID_LO)
                              & (live_scores <= GATE2_MID_HI)))

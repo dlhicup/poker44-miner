@@ -12,6 +12,7 @@ from typing import Tuple
 import bittensor as bt
 
 from neurons.detector import score_chunk as detector_score_chunk
+from neurons.detector import score_chunks_batch as detector_score_chunks_batch
 from neurons.detector import extract_features as detector_extract_features
 from poker44.base.miner import BaseMinerNeuron
 from poker44.utils.model_manifest import (
@@ -92,19 +93,22 @@ class Miner(BaseMinerNeuron):
             ],
             defaults={
                 "model_name": "poker44-behavioral-ensemble",
-                "model_version": "4.0.0",
+                "model_version": "5.0.0",
                 "framework": "python-tree-ensemble",
                 "license": "MIT",
                 "repo_url": "https://github.com/dlhicup/poker44-miner",
                 "notes": (
-                    "Tree ensemble with OOF-tuned blend weights over GBDT/ExtraTrees/"
-                    "RandomForest (current tuned weights select GBDT alone), pure-python "
-                    "inference, on transfer-gated behavioral chunk features (per-street "
-                    "rates, entropy, run-length, actor-geometry aggregates, action "
-                    "n-gram tokens); benchmark training data re-canonicalized through "
-                    "the live payload view for train/serve parity; within-query "
-                    "rank-budget shaping (order-preserving) pins the positive fraction. "
-                    "Trained by local_test/train_detector.py."
+                    "Two-branch blend, pure-python inference: a raw-feature tree "
+                    "ensemble (OOF-tuned weights over GBDT/ExtraTrees/RandomForest) "
+                    "plus a request-relative RANK branch (same architecture on each "
+                    "feature's tie-averaged percentile rank within the incoming "
+                    "request — immune to benchmark->live scale drift by construction). "
+                    "Transfer-gated behavioral chunk features (per-street rates, "
+                    "entropy, run-length, actor-geometry aggregates, action n-gram "
+                    "tokens); benchmark training data re-canonicalized through the "
+                    "live payload view for train/serve parity; within-query "
+                    "rank-budget shaping (order-preserving) pins the positive "
+                    "fraction. Trained by local_test/train_detector.py."
                 ),
                 "open_source": True,
                 "inference_mode": "remote",
@@ -161,17 +165,29 @@ class Miner(BaseMinerNeuron):
     async def forward(self, synapse: DetectionSynapse) -> DetectionSynapse:
         """Assign one deterministic bot-risk score per chunk."""
         chunks = synapse.chunks or []
-        # Fail-safe per-chunk scoring: a wrong-length response is discarded
-        # entirely by validators, so one bad chunk must never kill the reply.
-        raw = []
-        for i, chunk in enumerate(chunks):
-            try:
-                raw.append(self.score_chunk(chunk))
-            except Exception as exc:
-                bt.logging.warning(
-                    f"score_chunk failed on chunk {i}; using neutral 0.45: {exc}"
+        # Batch scoring (rank_blend needs the whole request for the
+        # within-request rank branch); falls back to per-chunk raw scoring on
+        # any batch-path failure. A wrong-length response is discarded
+        # entirely by validators, so the reply length must always match.
+        try:
+            raw = detector_score_chunks_batch(chunks)
+            if len(raw) != len(chunks):
+                raise ValueError(
+                    f"batch scorer returned {len(raw)} scores for {len(chunks)} chunks"
                 )
-                raw.append(0.45)
+        except Exception as exc:
+            bt.logging.warning(
+                f"batch scoring failed ({exc}); falling back to per-chunk raw path"
+            )
+            raw = []
+            for i, chunk in enumerate(chunks):
+                try:
+                    raw.append(self.score_chunk(chunk))
+                except Exception as chunk_exc:
+                    bt.logging.warning(
+                        f"score_chunk failed on chunk {i}; using neutral 0.45: {chunk_exc}"
+                    )
+                    raw.append(0.45)
         shaped = [round(s, 6) for s in shape_scores(raw)]
         synapse.risk_scores = shaped
         synapse.predictions = [s >= 0.5 for s in shaped]
