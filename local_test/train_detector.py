@@ -33,6 +33,7 @@ from pathlib import Path
 
 import numpy as np
 from joblib import Parallel, delayed
+from sklearn.covariance import LedoitWolf
 from sklearn.ensemble import (
     ExtraTreesClassifier,
     GradientBoostingClassifier,
@@ -328,6 +329,91 @@ def _tune_branch_blend(oof_raw: np.ndarray, oof_rank: np.ndarray, y: np.ndarray)
     return best
 
 
+# ---- Human Manifold branch (one-class, real humans only) -------------------
+
+def _fit_manifold(X_humans: np.ndarray) -> dict:
+    """Fit the human-typicality model on REAL human chunks only.
+
+    Ledoit-Wolf shrinkage covariance -> Mahalanobis distance from the human
+    center; d0/s map distance to a probability via sigmoid((d - d0) / s).
+    d0/s come from the human distance distribution itself (q90 anchor,
+    spread-scaled) — synthetic bots never shape any parameter here.
+    """
+    lw = LedoitWolf().fit(X_humans)
+    mu = lw.location_
+    prec = lw.precision_
+    diff = X_humans - mu
+    d = np.sqrt(np.maximum(0.0, np.einsum("ij,jk,ik->i", diff, prec, diff)))
+    d0 = float(np.quantile(d, 0.90))
+    s = float(max(1e-6, (np.quantile(d, 0.99) - np.quantile(d, 0.50)) / 3.0))
+    return {"mu": mu, "prec": prec, "d0": d0, "s": s}
+
+
+def _manifold_dists(man: dict, X: np.ndarray) -> np.ndarray:
+    diff = X - man["mu"]
+    return np.sqrt(np.maximum(0.0, np.einsum("ij,jk,ik->i", diff, man["prec"], diff)))
+
+
+def _oof_manifold_dists(X: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """5-fold OOF manifold DISTANCES (fit on train-fold HUMANS only)."""
+    oof = np.zeros(len(y))
+    for tr, te in StratifiedKFold(5, shuffle=True, random_state=0).split(X, y):
+        man = _fit_manifold(X[tr][y[tr] == 0])
+        oof[te] = _manifold_dists(man, X[te])
+    return oof
+
+
+def _ranks_within_blocks(values: np.ndarray, block_sizes: list) -> np.ndarray:
+    """Percentile-rank `values` within each contiguous block (release).
+
+    Mirrors serving, where the manifold's distances are ranked within the
+    incoming request: absolute Mahalanobis distances shift between benchmark
+    and live (joint covariance drift — a fixed sigmoid saturated to 1.0 on
+    every live chunk), but the ordering within one batch survives."""
+    out = np.zeros(len(values))
+    start = 0
+    for size in block_sizes:
+        block = values[start:start + size]
+        out[start:start + size] = np.asarray(percentile_ranks([float(v) for v in block]))
+        start += size
+    return out
+
+
+def _tune_tri_blend(
+    oof_raw: np.ndarray,
+    oof_rank: np.ndarray,
+    oof_man: np.ndarray,
+    y: np.ndarray,
+):
+    """Tune (raw, rank, manifold) weights + threshold on OOF predictions.
+
+    0.1-step simplex with the manifold capped at 0.4 — a one-class branch
+    complements the supervised branches, it must not dominate them.
+    Returns (weights_dict, threshold, oof_reward)."""
+    best = ({"raw": 0.6, "rank": 0.4, "manifold": 0.0}, 0.5, -1.0)
+    for wr10 in range(0, 11):
+        for wk10 in range(0, 11 - wr10):
+            wm10 = 10 - wr10 - wk10
+            if wm10 > 4:
+                continue
+            blend = (
+                (wr10 / 10) * oof_raw
+                + (wk10 / 10) * oof_rank
+                + (wm10 / 10) * oof_man
+            )
+            thr = float(np.quantile(blend[y == 0], 1.0 - TARGET_HUMAN_FPR))
+            thr = min(max(thr, 0.05), 0.95)
+            p = np.array([_calibrate(v, thr) for v in blend])
+            rew, _ = reward(p, y.astype(bool))
+            if rew > best[2]:
+                best = (
+                    {"raw": wr10 / 10, "rank": wk10 / 10, "manifold": wm10 / 10},
+                    thr,
+                    rew,
+                )
+    return best
+
+
 def report(tag: str, p: np.ndarray, y: np.ndarray) -> None:
     rew, met = reward(p, y)
     print(f"  {tag}: AUC={roc_auc_score(y, p):.3f} reward={rew:.4f} "
@@ -368,11 +454,11 @@ def main() -> None:
     print("\n== Leave-one-release-out (full-size releases; "
           "threshold from train-side OOF only) ==")
     def _loro_fold(date, X_te):
-        """One fold of the full two-branch pipeline, train-side-only tuning:
-        raw ensemble (3 members, OOF-tuned internal weights) + rank-branch
-        GBDT (within-release rank views) + raw/rank blend weight and
-        threshold from train-side OOF. Scores the held-out date exactly as
-        serving would (its rank view computed within itself)."""
+        """One fold of the full three-branch pipeline, train-side-only tuning:
+        raw ensemble (OOF-tuned internal weights) + rank-branch GBDT
+        (within-release rank views) + human-manifold one-class (fit on
+        train-side HUMANS only) + tri-blend weights and threshold from
+        train-side OOF. Scores the held-out date exactly as serving would."""
         X_tr = np.vstack([X for d, X, _ in releases if d != date])
         y_tr = np.concatenate([y for d, _, y in releases if d != date])
         X_tr_rank = np.vstack([releases_rank[d] for d, _, _ in releases if d != date])
@@ -386,10 +472,19 @@ def main() -> None:
         rank_model = GradientBoostingClassifier(**GBM_PARAMS).fit(X_tr_rank, y_tr)
         oof_rank = _gb_oof(X_tr_rank, y_tr)
 
-        w_raw, thr, _ = _tune_branch_blend(oof_raw, oof_rank, y_tr)
+        man = _fit_manifold(X_tr[y_tr == 0])
+        tr_sizes = [len(yr) for d, _, yr in releases if d != date]
+        oof_man = _ranks_within_blocks(_oof_manifold_dists(X_tr, y_tr), tr_sizes)
+
+        tri_w, thr, _ = _tune_tri_blend(oof_raw, oof_rank, oof_man, y_tr)
         p_raw = _blend_probs(models, weights, X_te)
         p_rank = rank_model.predict_proba(X_te_rank)[:, 1]
-        blend = w_raw * p_raw + (1.0 - w_raw) * p_rank
+        p_man = _ranks_within_blocks(_manifold_dists(man, X_te), [len(X_te)])
+        blend = (
+            tri_w["raw"] * p_raw
+            + tri_w["rank"] * p_rank
+            + tri_w["manifold"] * p_man
+        )
         return thr, np.array([_calibrate(v, thr) for v in blend])
 
     fold_out = Parallel(n_jobs=6)(
@@ -416,10 +511,20 @@ def main() -> None:
     final_rank = GradientBoostingClassifier(**GBM_PARAMS).fit(X_rank, y)
     oof_rank = _gb_oof(X_rank, y)
 
-    w_raw, threshold, oof_rew = _tune_branch_blend(oof_raw, oof_rank, y)
-    print(f"\n[final] fit on {len(y)} groups | raw member weights={weights} "
-          f"| w_raw={w_raw} | threshold={threshold:.4f} "
-          f"| OOF blend reward={oof_rew:.4f}")
+    final_man = _fit_manifold(X[y == 0])
+    all_sizes = [len(yr) for _, _, yr in releases]
+    oof_man = _ranks_within_blocks(_oof_manifold_dists(X, y), all_sizes)
+
+    tri_w, threshold, oof_rew = _tune_tri_blend(oof_raw, oof_rank, oof_man, y)
+    w_raw = tri_w["raw"]  # legacy key, kept in the export for compatibility
+    n_humans = int((y == 0).sum())
+    print(f"\n[final] fit on {len(y)} groups ({n_humans} real-human for the "
+          f"manifold) | raw member weights={weights} | tri weights={tri_w} "
+          f"| threshold={threshold:.4f} | OOF blend reward={oof_rew:.4f}")
+    if tri_w["manifold"] == 0.0:
+        print("[manifold] OOF tuner selected weight 0.0 — manifold ships "
+              "disabled; promotion would need the live A/B path "
+              "(INNOVATION_PLAN Weapon 3).")
 
     # ---- export every member as flat tree arrays (pure-Python inference) ----
     def _export_regression_trees(gbc):
@@ -490,17 +595,24 @@ def main() -> None:
     ]
 
     dates = ", ".join(d for d, _, _ in releases)
-    body = json.dumps(
-        {
-            "model": "rank_blend",
-            "feature_names": features,
-            "threshold": threshold,
-            "w_raw": w_raw,
-            "raw_members": raw_members,
-            "rank_members": rank_members,
-        },
-        separators=(",", ":"),
-    )
+    payload = {
+        "model": "rank_blend",
+        "feature_names": features,
+        "threshold": threshold,
+        "w_raw": w_raw,
+        "weights": tri_w,
+        "raw_members": raw_members,
+        "rank_members": rank_members,
+    }
+    if tri_w["manifold"] > 0.0:
+        payload["manifold"] = {
+            "output": "rank",  # serve as within-request distance ranks
+            "mu": [float(v) for v in final_man["mu"]],
+            "prec": [[float(v) for v in row] for row in final_man["prec"]],
+            "d0": final_man["d0"],  # sigmoid fallback for single-chunk path
+            "s": final_man["s"],
+        }
+    body = json.dumps(payload, separators=(",", ":"))
     PARAMS_PATH.write_text(
         '"""Auto-generated by local_test/train_detector.py — do not edit by hand.\n'
         "\n"
@@ -541,9 +653,39 @@ def main() -> None:
         )
         if abs(got - expect) > 1e-4:
             sys.exit(f"RANK PARITY FAILURE: pure-python {got} vs sklearn {expect}")
+    if det.PARAMS.get("manifold"):
+        np_d = _manifold_dists(final_man, X[:200])
+        for row, expect in zip(X[:200], np_d):
+            got = det._manifold_distance(
+                det.PARAMS["manifold"], [float(v) for v in row]
+            )
+            if abs(got - expect) > 1e-6 * max(1.0, abs(expect)):
+                sys.exit(
+                    f"MANIFOLD PARITY FAILURE: pure-python {got} vs numpy {expect}"
+                )
     gate3 = True
-    print("[parity] pure-Python raw + rank branch inference matches sklearn "
-          "on 200 samples each ✓")
+    print("[parity] pure-Python raw + rank"
+          + (" + manifold" if det.PARAMS.get("manifold") else "")
+          + " inference matches reference on 200 samples each ✓")
+
+    # ---- manifold kill-criteria probe (INNOVATION_PLAN Phase A) ----
+    # Decorrelation is measured on DISTANCES (the served signal is their
+    # within-request rank, a monotone transform, so Spearman is identical).
+    from scipy.stats import spearmanr
+    live_raw_p = np.array([
+        det._members_probability(det.PARAMS["raw_members"], [float(v) for v in row])
+        for row in X_live
+    ])
+    live_man_d = _manifold_dists(final_man, X_live)
+    live_man_rank = _ranks_within_blocks(live_man_d, [len(X_live)])
+    rho = float(spearmanr(live_raw_p, live_man_d).statistic)
+    print(f"\n== Manifold probe (live capture, {len(X_live)} chunks) ==")
+    print(f"  live Spearman manifold-vs-raw = {rho:.4f} "
+          f"(kill if > 0.9: {'KILL — nothing new' if rho > 0.9 else 'OK — new signal'})")
+    print(f"  manifold served ranks: std={float(np.std(live_man_rank)):.4f} "
+          f"(uniform by construction) | raw distance spread: "
+          f"std={float(np.std(live_man_d)):.4f} "
+          f"deciles={np.round(np.quantile(live_man_d, [.1,.5,.9]), 2).tolist()}")
 
     # ---- GATE 2: live replay through the TRUE serving path (batch scorer
     # with the within-request rank branch) on the captured 100-chunk query ----

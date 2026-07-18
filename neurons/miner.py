@@ -93,22 +93,22 @@ class Miner(BaseMinerNeuron):
             ],
             defaults={
                 "model_name": "poker44-behavioral-ensemble",
-                "model_version": "5.0.0",
+                "model_version": "6.0.0",
                 "framework": "python-tree-ensemble",
                 "license": "MIT",
                 "repo_url": "https://github.com/dlhicup/poker44-miner",
                 "notes": (
-                    "Two-branch blend, pure-python inference: a raw-feature tree "
-                    "ensemble (OOF-tuned weights over GBDT/ExtraTrees/RandomForest) "
-                    "plus a request-relative RANK branch (same architecture on each "
-                    "feature's tie-averaged percentile rank within the incoming "
-                    "request — immune to benchmark->live scale drift by construction). "
-                    "Transfer-gated behavioral chunk features (per-street rates, "
-                    "entropy, run-length, actor-geometry aggregates, action n-gram "
-                    "tokens); benchmark training data re-canonicalized through the "
-                    "live payload view for train/serve parity; within-query "
-                    "rank-budget shaping (order-preserving) pins the positive "
-                    "fraction. Trained by local_test/train_detector.py."
+                    "Multi-branch blend, pure-python inference, OOF-tuned weights: "
+                    "raw-feature tree ensemble + request-relative RANK branch (each "
+                    "feature's percentile rank within the incoming request — immune "
+                    "to benchmark->live scale drift by construction) + optional "
+                    "human-typicality MANIFOLD branch (one-class Ledoit-Wolf "
+                    "Mahalanobis fitted on real human examples only; shipped only "
+                    "when selected by the OOF weight tuner). Transfer-gated "
+                    "behavioral chunk features; benchmark data re-canonicalized "
+                    "through the live payload view for train/serve parity; "
+                    "within-query rank-budget shaping (order-preserving) pins the "
+                    "positive fraction. Trained by local_test/train_detector.py."
                 ),
                 "open_source": True,
                 "inference_mode": "remote",

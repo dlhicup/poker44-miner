@@ -501,6 +501,38 @@ def _members_probability(members: List[Dict[str, Any]], x: List[float]) -> float
     return sum(m["weight"] * _member_probability(m, x) for m in members)
 
 
+def _manifold_probability(man: Dict[str, Any], x: List[float]) -> float:
+    """Human-manifold branch: bot-risk from distance to the human center.
+
+    One-class model fitted on REAL human chunks only (Ledoit-Wolf shrinkage
+    covariance); synthetic bots never shape it — they only calibrated the
+    d0/s distance-to-probability mapping. Score = sigmoid of the Mahalanobis
+    distance from the human center: far from "humanly normal" -> bot-like.
+    Real bots, whatever they look like, are not human — so this branch does
+    not depend on the benchmark's synthetic bots resembling them.
+    """
+    return _sigmoid((_manifold_distance(man, x) - man["d0"]) / man["s"])
+
+
+def _manifold_distance(man: Dict[str, Any], x: List[float]) -> float:
+    """Mahalanobis distance from the human center (pure python)."""
+    mu = man["mu"]
+    prec = man["prec"]
+    n = len(mu)
+    d = [x[i] - mu[i] for i in range(n)]
+    q = 0.0
+    for i in range(n):
+        di = d[i]
+        if di == 0.0:
+            continue
+        row = prec[i]
+        acc = 0.0
+        for j in range(n):
+            acc += row[j] * d[j]
+        q += di * acc
+    return math.sqrt(max(0.0, q))
+
+
 def score_chunks_batch(chunks: List[List[Dict[str, Any]]]) -> List[float]:
     """Score a whole validator request at once (the production path).
 
@@ -541,16 +573,45 @@ def score_chunks_batch(chunks: List[List[Dict[str, Any]]]) -> List[float]:
         for pos, i in enumerate(valid):
             x_rank = [ranked[j][pos] for j in range(len(names))]
             rank_p[i] = _members_probability(PARAMS["rank_members"], x_rank)
+    man = PARAMS.get("manifold")
+    man_p: Dict[int, float] = {}
+    if man is not None:
+        if man.get("output") == "rank" and len(valid) >= 8:
+            # Distance-from-human graded on the day's curve: the ABSOLUTE
+            # Mahalanobis distance shifts between benchmark and live (joint
+            # covariance drift saturated a fixed sigmoid), but the ORDERING
+            # of distances within one request survives — so emit each
+            # chunk's percentile rank of distance within the request.
+            dists = [_manifold_distance(man, rows[i]) for i in valid]
+            ranked = percentile_ranks(dists)
+            for pos, i in enumerate(valid):
+                man_p[i] = ranked[pos]
+        else:
+            for i in valid:
+                man_p[i] = _manifold_probability(man, rows[i])
 
-    w = PARAMS["w_raw"]
+    # Branch weights: "weights" dict (raw/rank/manifold) with legacy
+    # w_raw fallback. Missing branches renormalize among the present ones.
+    w = PARAMS.get("weights") or {
+        "raw": PARAMS["w_raw"],
+        "rank": 1.0 - PARAMS["w_raw"],
+        "manifold": 0.0,
+    }
     out: List[float] = []
     for i in range(len(chunks)):
         if rows[i] is None:
             out.append(_NEUTRAL_SCORE)
             continue
-        p = raw_p[i]
+        parts = [("raw", raw_p[i])]
         if i in rank_p:
-            p = w * p + (1.0 - w) * rank_p[i]
+            parts.append(("rank", rank_p[i]))
+        if i in man_p and w.get("manifold", 0.0) > 0.0:
+            parts.append(("manifold", man_p[i]))
+        total_w = sum(w.get(k, 0.0) for k, _ in parts)
+        if total_w <= 0.0:
+            p = raw_p[i]
+        else:
+            p = sum(w.get(k, 0.0) * v for k, v in parts) / total_w
         out.append(
             round(min(0.999, max(0.001, _calibrate(p, PARAMS["threshold"]))), 6)
         )
@@ -570,8 +631,24 @@ def score_chunk(chunk: List[Dict[str, Any]]) -> float:
     features = extract_features(chunk)
 
     if PARAMS.get("model") == "rank_blend":
+        # Single-chunk path: raw branch (+ manifold, which needs no batch);
+        # the rank branch requires the rest of the request (batch path).
         x = [features[name] for name in PARAMS["feature_names"]]
-        probability = _members_probability(PARAMS["raw_members"], x)
+        w = PARAMS.get("weights") or {
+            "raw": PARAMS["w_raw"],
+            "rank": 1.0 - PARAMS["w_raw"],
+            "manifold": 0.0,
+        }
+        parts = [("raw", _members_probability(PARAMS["raw_members"], x))]
+        man = PARAMS.get("manifold")
+        if man is not None and w.get("manifold", 0.0) > 0.0:
+            parts.append(("manifold", _manifold_probability(man, x)))
+        total_w = sum(w.get(k, 0.0) for k, _ in parts)
+        probability = (
+            sum(w.get(k, 0.0) * v for k, v in parts) / total_w
+            if total_w > 0
+            else parts[0][1]
+        )
         calibrated = _calibrate(probability, PARAMS["threshold"])
         return round(min(0.999, max(0.001, calibrated)), 6)
 
