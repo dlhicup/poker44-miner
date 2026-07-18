@@ -91,18 +91,20 @@ class Miner(BaseMinerNeuron):
                 neurons_dir / "detector_params.py",
             ],
             defaults={
-                "model_name": "poker44-behavioral-gbdt",
-                "model_version": "3.0.0",
-                "framework": "python-gbdt",
+                "model_name": "poker44-behavioral-ensemble",
+                "model_version": "4.0.0",
+                "framework": "python-tree-ensemble",
                 "license": "MIT",
                 "repo_url": "https://github.com/dlhicup/poker44-miner",
                 "notes": (
-                    "Gradient-boosted trees (pure-python inference) on ~100 "
-                    "distribution-stable behavioral chunk features (per-street rates, "
-                    "entropy, run-length, actor-geometry aggregates); benchmark training "
-                    "data re-canonicalized through the live payload view for train/serve "
-                    "parity; within-query rank-budget shaping (order-preserving) pins the "
-                    "positive fraction. Trained by local_test/train_detector.py."
+                    "Tree ensemble with OOF-tuned blend weights over GBDT/ExtraTrees/"
+                    "RandomForest (current tuned weights select GBDT alone), pure-python "
+                    "inference, on transfer-gated behavioral chunk features (per-street "
+                    "rates, entropy, run-length, actor-geometry aggregates, action "
+                    "n-gram tokens); benchmark training data re-canonicalized through "
+                    "the live payload view for train/serve parity; within-query "
+                    "rank-budget shaping (order-preserving) pins the positive fraction. "
+                    "Trained by local_test/train_detector.py."
                 ),
                 "open_source": True,
                 "inference_mode": "remote",

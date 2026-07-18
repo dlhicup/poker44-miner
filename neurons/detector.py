@@ -176,6 +176,40 @@ _CHUNK_LEVEL_FEATURES = (
     "sig_street_unique_share",
 )
 
+# ---- action n-gram token vocabulary (fixed, deterministic order) ----------
+# Short "phrases" of play, normalized per hand so 30-hand benchmark chunks
+# and 80-100-hand live chunks stay comparable. Only censor-surviving action
+# types appear. Pot-ratio buckets use amount/pot_before — a ratio of two
+# same-scale quantities, so it does not inherit the absolute-bb scale shift
+# that killed the raw bet-size features (the transfer gate still vets every
+# token individually).
+_ACTION_CODE = {"fold": "f", "call": "c", "check": "k", "bet": "b", "raise": "r"}
+_STREET_CODE = {"preflop": "p", "flop": "f", "turn": "t", "river": "r"}
+_NG1_TOKENS = tuple(
+    f"ng1_{s}{a}" for s in "pftr" for a in "fckbr"
+)  # 20 street+action unigrams
+_NG2_TOKENS = tuple(
+    f"ng2_{a}{b}" for a in "fckbr" for b in "fckbr"
+)  # 25 action bigrams
+_POT_BUCKETS = ("z", "s", "m", "p", "o")  # 0 / <0.4 / <0.9 / <1.5 / >=1.5
+_NGP_TOKENS = tuple(
+    f"ngp_{a}{b}" for a in "br" for b in _POT_BUCKETS
+)  # 10 sized-aggression tokens
+_NGRAM_FEATURES = _NG1_TOKENS + _NG2_TOKENS + _NGP_TOKENS
+
+
+def _pot_bucket(amount: float, pot_before: float) -> str:
+    if amount <= 0 or pot_before <= 0:
+        return "z"
+    ratio = amount / pot_before
+    if ratio < 0.4:
+        return "s"
+    if ratio < 0.9:
+        return "m"
+    if ratio < 1.5:
+        return "p"
+    return "o"
+
 # Candidate feature names for the trainer's transfer gate: every new
 # aggregate/chunk-level feature plus the scale-free legacy features. The
 # three betsize_* legacy features are EXCLUDED (verified 340x
@@ -183,6 +217,7 @@ _CHUNK_LEVEL_FEATURES = (
 CANDIDATE_FEATURES: List[str] = (
     [f"{stat}__{agg}" for stat in _PER_HAND_STATS for agg in _AGG_SUFFIXES]
     + list(_CHUNK_LEVEL_FEATURES)
+    + list(_NGRAM_FEATURES)
     + [
         "flop_fold_rate",
         "turn_fold_rate",
@@ -219,6 +254,7 @@ def extract_features(chunk: List[Dict[str, Any]]) -> Dict[str, float]:
     sig_action: Counter = Counter()
     sig_actor: Counter = Counter()
     sig_street: Counter = Counter()
+    ngram_counts: Counter = Counter()
 
     for hand in hands:
         actions = hand.get("actions") or []
@@ -309,6 +345,27 @@ def extract_features(chunk: List[Dict[str, Any]]) -> Dict[str, float]:
         sig_actor[tuple(actor_seats)] += 1
         sig_street[tuple(action_streets)] += 1
 
+        # ---- n-gram tokens (counts accumulated chunk-wide) ---------------
+        codes: List[str] = []
+        for a in actions:
+            code = _ACTION_CODE.get(str(a.get("action_type", "")))
+            if code is None:
+                codes.append("")
+                continue
+            codes.append(code)
+            street_c = _STREET_CODE.get(str(a.get("street", "")).lower())
+            if street_c is not None:
+                ngram_counts[f"ng1_{street_c}{code}"] += 1
+            if code in ("b", "r"):
+                bucket = _pot_bucket(
+                    float(a.get("amount") or 0.0),
+                    float(a.get("pot_before") or 0.0),
+                )
+                ngram_counts[f"ngp_{code}{bucket}"] += 1
+        for j in range(1, len(codes)):
+            if codes[j - 1] and codes[j]:
+                ngram_counts[f"ng2_{codes[j - 1]}{codes[j]}"] += 1
+
     bet_counter = Counter(bets)
     n_bets = len(bets)
     features: Dict[str, float] = {
@@ -349,6 +406,10 @@ def extract_features(chunk: List[Dict[str, Any]]) -> Dict[str, float]:
         features[f"{prefix}_top_share"] = top / n_h
         features[f"{prefix}_unique_share"] = len(counter) / n_h
 
+    # ---- n-gram tokens, normalized per hand ------------------------------
+    for token in _NGRAM_FEATURES:
+        features[token] = ngram_counts[token] / n_h
+
     return features
 
 
@@ -386,6 +447,28 @@ def _eval_tree(tree: Dict[str, List[float]], x: List[float]) -> float:
     return v[i]
 
 
+def _sigmoid(logit: float) -> float:
+    return 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, logit))))
+
+
+def _member_probability(member: Dict[str, Any], x: List[float]) -> float:
+    """Probability of class 1 from one exported ensemble member."""
+    kind = member.get("kind")
+    if kind == "gbdt":
+        # Staged additive regression trees -> logit -> sigmoid.
+        logit = member["init"]
+        rate = member["learning_rate"]
+        for tree in member["trees"]:
+            logit += rate * _eval_tree(tree, x)
+        return _sigmoid(logit)
+    # kind == "forest": averaging classifier — each leaf already stores the
+    # class-1 probability of that leaf; the forest averages over trees.
+    total = 0.0
+    for tree in member["trees"]:
+        total += _eval_tree(tree, x)
+    return total / max(1, len(member["trees"]))
+
+
 def score_chunk(chunk: List[Dict[str, Any]]) -> float:
     """One bot-risk score in [0, 1] for a chunk of censored hands."""
     if not chunk or PARAMS is None:
@@ -393,23 +476,32 @@ def score_chunk(chunk: List[Dict[str, Any]]) -> float:
 
     features = extract_features(chunk)
 
-    if PARAMS.get("model") == "gbdt":
-        # Gradient-boosted trees on RAW feature values. Trees natively learn
-        # two-sided splits where dispersion matters AND keep the directional
-        # signal of the near-human bot family (a two-sided |z| transform
-        # destroys the sign and made that family invisible — see forensics).
+    if PARAMS.get("model") == "ensemble":
+        # Weighted blend of heterogeneous tree families (GBDT + ExtraTrees +
+        # RandomForest), the structure every top miner on this subnet runs:
+        # decorrelated tree families generalize better than a single GBDT on
+        # a small, shifting training set. Weights are tuned on out-of-fold
+        # predictions against the authoritative validator reward.
+        x = [features[name] for name in PARAMS["feature_names"]]
+        probability = sum(
+            member["weight"] * _member_probability(member, x)
+            for member in PARAMS["members"]
+        )
+    elif PARAMS.get("model") == "gbdt":
+        # Single gradient-boosted model (v3 format, kept loadable).
         x = [features[name] for name in PARAMS["feature_names"]]
         logit = PARAMS["init"]
         rate = PARAMS["learning_rate"]
         for tree in PARAMS["trees"]:
             logit += rate * _eval_tree(tree, x)
+        probability = _sigmoid(logit)
     else:
         # Legacy linear form: two-sided robust |z| -> logistic weights.
         logit = PARAMS["bias"]
         for name, center, scale, weight in PARAMS["features"]:
             z = abs(features[name] - center) / scale
             logit += weight * z
+        probability = _sigmoid(logit)
 
-    probability = 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, logit))))
     calibrated = _calibrate(probability, PARAMS["threshold"])
     return round(min(0.999, max(0.001, calibrated)), 6)

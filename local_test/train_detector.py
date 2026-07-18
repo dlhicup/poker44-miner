@@ -33,7 +33,11 @@ from pathlib import Path
 
 import numpy as np
 from joblib import Parallel, delayed
-from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.ensemble import (
+    ExtraTreesClassifier,
+    GradientBoostingClassifier,
+    RandomForestClassifier,
+)
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
@@ -49,7 +53,8 @@ CAPTURES_DIR = REPO / "local_test" / "captures"
 # Bumped whenever the featurisation input changes; stale caches are ignored.
 # v4: expanded CANDIDATE_FEATURES matrix + parity re-canonicalization of the
 # benchmark hands through build_miner_payload_hand (see load_all_releases).
-CACHE_VERSION = 4
+# v5: action n-gram token features added to CANDIDATE_FEATURES.
+CACHE_VERSION = 5
 TARGET_HUMAN_FPR = 0.07     # <=7% humans over 0.5 (validator gate allows 10%)
 FULL_SIZE_MIN_GROUPS = 100  # releases smaller than this are pilot-era noise
 GATE_BENCH_SAMPLE = 200     # benchmark chunks sampled for the transfer gate
@@ -60,6 +65,22 @@ GBM_PARAMS = dict(
     subsample=0.8,
     random_state=0,
 )
+# Heterogeneous ensemble members (the structure every top miner runs):
+# decorrelated tree families generalize better than one GBDT on a small,
+# shifting training set. Depth/leaf caps keep the pure-python export a few MB.
+FOREST_PARAMS = dict(
+    n_estimators=200,
+    max_depth=7,
+    min_samples_leaf=20,
+    random_state=0,
+    n_jobs=1,
+)
+# Blend-weight grid: all (w_gb, w_et, w_rf) on the 0.1-step simplex.
+BLEND_GRID = [
+    (a / 10, b / 10, (10 - a - b) / 10)
+    for a in range(11)
+    for b in range(11 - a)
+]
 PARAMS_PATH = REPO / "neurons" / "detector_params.py"
 
 # Gate acceptance criteria (reported honestly; no workarounds if they fail).
@@ -223,6 +244,47 @@ def oof_threshold(X: np.ndarray, y: np.ndarray) -> float:
     return min(max(threshold, 0.05), 0.95)
 
 
+def _fit_members(X: np.ndarray, y: np.ndarray) -> dict:
+    """Fit the three ensemble members."""
+    return {
+        "gb": GradientBoostingClassifier(**GBM_PARAMS).fit(X, y),
+        "et": ExtraTreesClassifier(**FOREST_PARAMS).fit(X, y),
+        "rf": RandomForestClassifier(**FOREST_PARAMS).fit(X, y),
+    }
+
+
+def _oof_member_probs(X: np.ndarray, y: np.ndarray) -> dict:
+    """5-fold out-of-fold class-1 probabilities for each member family."""
+    oof = {k: np.zeros(len(y)) for k in ("gb", "et", "rf")}
+    for tr, te in StratifiedKFold(5, shuffle=True, random_state=0).split(X, y):
+        fold_models = _fit_members(X[tr], y[tr])
+        for key, model in fold_models.items():
+            oof[key][te] = model.predict_proba(X[te])[:, 1]
+    return oof
+
+
+def _tune_blend(oof: dict, y: np.ndarray) -> tuple:
+    """Pick blend weights + calibration threshold on OOF predictions,
+    maximizing the authoritative validator reward. Returns
+    (weights_dict, threshold, oof_reward)."""
+    best = (None, 0.5, -1.0)
+    for w_gb, w_et, w_rf in BLEND_GRID:
+        blend = w_gb * oof["gb"] + w_et * oof["et"] + w_rf * oof["rf"]
+        thr = float(np.quantile(blend[y == 0], 1.0 - TARGET_HUMAN_FPR))
+        thr = min(max(thr, 0.05), 0.95)
+        p = np.array([_calibrate(v, thr) for v in blend])
+        rew, _ = reward(p, y.astype(bool))
+        if rew > best[2]:
+            best = ({"gb": w_gb, "et": w_et, "rf": w_rf}, thr, rew)
+    return best
+
+
+def _blend_probs(models: dict, weights: dict, X: np.ndarray) -> np.ndarray:
+    return sum(
+        weights[k] * models[k].predict_proba(X)[:, 1] for k in ("gb", "et", "rf")
+    )
+
+
 def report(tag: str, p: np.ndarray, y: np.ndarray) -> None:
     rew, met = reward(p, y)
     print(f"  {tag}: AUC={roc_auc_score(y, p):.3f} reward={rew:.4f} "
@@ -260,15 +322,17 @@ def main() -> None:
     print("\n== Leave-one-release-out (full-size releases; "
           "threshold from train-side OOF only) ==")
     def _loro_fold(date, X_te):
-        """One fold: fit + OOF threshold on the train side, score held-out.
-        Identical math to the serial loop (fixed random_state everywhere);
-        folds are independent so they run in parallel for wall-time only."""
+        """One fold: fit the 3-member ensemble on the train side, tune blend
+        weights + threshold on train-side OOF only, score the held-out date.
+        Identical math across folds (fixed random_state everywhere); folds
+        are independent so they run in parallel for wall-time only."""
         X_tr = np.vstack([X for d, X, _ in releases if d != date])
         y_tr = np.concatenate([y for d, _, y in releases if d != date])
-        model = GradientBoostingClassifier(**GBM_PARAMS).fit(X_tr, y_tr)
-        thr = oof_threshold(X_tr, y_tr)
-        return thr, np.array([_calibrate(v, thr)
-                              for v in model.predict_proba(X_te)[:, 1]])
+        models = _fit_members(X_tr, y_tr)
+        oof = _oof_member_probs(X_tr, y_tr)
+        weights, thr, _ = _tune_blend(oof, y_tr)
+        blend = _blend_probs(models, weights, X_te)
+        return thr, np.array([_calibrate(v, thr) for v in blend])
 
     fold_out = Parallel(n_jobs=6)(
         delayed(_loro_fold)(date, X_te) for date, X_te, _ in full)
@@ -281,48 +345,93 @@ def main() -> None:
     print(f"\n  LORO mean reward = {loro_mean:.4f}  "
           f"min={min(fold_rewards):.4f}  max={max(fold_rewards):.4f}")
 
-    # ---- final model: fit on ALL releases, OOF-calibrated ----
+    # ---- final ensemble: fit on ALL releases, OOF blend + calibration ----
     X = np.vstack([Xr for _, Xr, _ in releases])
     y = np.concatenate([yr for _, _, yr in releases])
-    final = GradientBoostingClassifier(**GBM_PARAMS).fit(X, y)
-    threshold = oof_threshold(X, y)
-    print(f"\n[final] fit on {len(y)} groups | calibration threshold={threshold:.4f}")
+    final_models = _fit_members(X, y)
+    final_oof = _oof_member_probs(X, y)
+    weights, threshold, oof_rew = _tune_blend(final_oof, y)
+    print(f"\n[final] fit on {len(y)} groups | blend weights={weights} "
+          f"| threshold={threshold:.4f} | OOF reward={oof_rew:.4f}")
 
-    # ---- export every tree as flat arrays (pure-Python inference) ----
-    trees = []
-    for stage in final.estimators_:          # (n_stages, 1) regressor trees
-        t = stage[0].tree_
-        trees.append({
-            # full-precision thresholds: sklearn compares float32(x) against
-            # float64 thresholds, and any rounding here can flip a split
-            "f": [int(v) for v in t.feature],
-            "t": [float(v) for v in t.threshold],
-            "l": [int(v) for v in t.children_left],
-            "r": [int(v) for v in t.children_right],
-            "v": [float(v[0][0]) for v in t.value],
-        })
-    # sklearn GBC initial raw prediction = log-odds of the base rate
+    # ---- export every member as flat tree arrays (pure-Python inference) ----
+    def _export_regression_trees(gbc):
+        """GBDT stages: leaf value = raw additive contribution."""
+        out = []
+        for stage in gbc.estimators_:        # (n_stages, 1) regressor trees
+            t = stage[0].tree_
+            out.append({
+                # full-precision thresholds: sklearn compares float32(x)
+                # against float64 thresholds; rounding can flip a split
+                "f": [int(v) for v in t.feature],
+                "t": [float(v) for v in t.threshold],
+                "l": [int(v) for v in t.children_left],
+                "r": [int(v) for v in t.children_right],
+                "v": [float(v[0][0]) for v in t.value],
+            })
+        return out
+
+    def _export_forest_trees(forest):
+        """Averaging classifiers: leaf value = class-1 probability at leaf."""
+        out = []
+        for est in forest.estimators_:
+            t = est.tree_
+            values = []
+            for node in t.value:             # shape (1, 2): class counts/fracs
+                c0, c1 = float(node[0][0]), float(node[0][1])
+                values.append(c1 / max(1e-12, c0 + c1))
+            out.append({
+                "f": [int(v) for v in t.feature],
+                "t": [float(v) for v in t.threshold],
+                "l": [int(v) for v in t.children_left],
+                "r": [int(v) for v in t.children_right],
+                "v": values,
+            })
+        return out
+
     prior = float(np.clip(np.mean(y), 1e-9, 1 - 1e-9))
     init = float(np.log(prior / (1.0 - prior)))
+    members = [
+        {
+            "kind": "gbdt",
+            "weight": weights["gb"],
+            "init": init,
+            "learning_rate": GBM_PARAMS["learning_rate"],
+            "trees": _export_regression_trees(final_models["gb"]),
+        },
+        {
+            "kind": "forest",
+            "weight": weights["et"],
+            "trees": _export_forest_trees(final_models["et"]),
+        },
+        {
+            "kind": "forest",
+            "weight": weights["rf"],
+            "trees": _export_forest_trees(final_models["rf"]),
+        },
+    ]
+    # Drop zero-weight members entirely — smaller file, faster inference.
+    members = [m for m in members if m["weight"] > 0]
 
     dates = ", ".join(d for d, _, _ in releases)
     body = json.dumps(
         {
-            "model": "gbdt",
+            "model": "ensemble",
             "feature_names": features,
-            "init": init,
-            "learning_rate": GBM_PARAMS["learning_rate"],
             "threshold": threshold,
-            "trees": trees,
+            "members": members,
         },
         separators=(",", ":"),
     )
     PARAMS_PATH.write_text(
         '"""Auto-generated by local_test/train_detector.py — do not edit by hand.\n'
         "\n"
-        f"Gradient-boosted trees ({GBM_PARAMS['n_estimators']} x depth "
-        f"{GBM_PARAMS['max_depth']}) on {len(features)} transfer-gated features\n"
-        "(parity-transformed benchmark hands via build_miner_payload_hand).\n"
+        f"Heterogeneous tree ensemble (GBDT {GBM_PARAMS['n_estimators']}x"
+        f"d{GBM_PARAMS['max_depth']} + ExtraTrees/RandomForest "
+        f"{FOREST_PARAMS['n_estimators']}xd{FOREST_PARAMS['max_depth']}), "
+        f"blend weights {weights},\n"
+        f"on {len(features)} transfer-gated features "
+        "(parity-transformed benchmark hands).\n"
         f"Trained on {len(releases)} banked releases ({len(y)} labeled groups): "
         f"{dates}\n"
         '"""\n'
@@ -330,25 +439,28 @@ def main() -> None:
         f"PARAMS = _json.loads({body!r})\n"
     )
     size_kb = PARAMS_PATH.stat().st_size / 1024
-    print(f"[write] {PARAMS_PATH} ({size_kb:.0f} KB, {len(trees)} trees)")
+    n_trees = sum(len(m["trees"]) for m in members)
+    print(f"[write] {PARAMS_PATH} ({size_kb:.0f} KB, {n_trees} trees, "
+          f"{len(members)} members)")
 
-    # ---- parity check: exported pure-Python path vs sklearn ----
+    # ---- parity check: exported pure-Python ensemble vs sklearn blend ----
     from importlib import reload
     import neurons.detector_params
     import neurons.detector as det
     reload(neurons.detector_params)
     reload(det)
-    sk_prob = final.predict_proba(X[:200])[:, 1]
-    for row, expect in zip(X[:200], sk_prob):
-        feats = dict(zip(features, row))
-        logit = det.PARAMS["init"] + det.PARAMS["learning_rate"] * sum(
-            det._eval_tree(tree, [feats[n] for n in features])
-            for tree in det.PARAMS["trees"])
-        got = 1.0 / (1.0 + np.exp(-logit))
+    sk_blend = _blend_probs(final_models, weights, X[:200])
+    for row, expect in zip(X[:200], sk_blend):
+        x_list = [float(v) for v in row]
+        got = sum(
+            m["weight"] * det._member_probability(m, x_list)
+            for m in det.PARAMS["members"]
+        )
         if abs(got - expect) > 1e-4:
             sys.exit(f"PARITY FAILURE: pure-python {got} vs sklearn {expect}")
     gate3 = True
-    print("[parity] pure-Python tree inference matches sklearn on 200 samples ✓")
+    print("[parity] pure-Python ensemble inference matches sklearn on "
+          "200 samples ✓")
 
     # ---- GATE 2: live replay with the NEW exported params ----
     live_scores = np.array([det.score_chunk(chunk) for chunk in live_chunks])
