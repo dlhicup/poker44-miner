@@ -93,7 +93,7 @@ class Miner(BaseMinerNeuron):
             ],
             defaults={
                 "model_name": "poker44-behavioral-ensemble",
-                "model_version": "6.0.0",
+                "model_version": "6.1.0",
                 "framework": "python-tree-ensemble",
                 "license": "MIT",
                 "repo_url": "https://github.com/dlhicup/poker44-miner",
@@ -107,16 +107,22 @@ class Miner(BaseMinerNeuron):
                     "when selected by the OOF weight tuner). Transfer-gated "
                     "behavioral chunk features; benchmark data re-canonicalized "
                     "through the live payload view for train/serve parity; "
-                    "within-query rank-budget shaping (order-preserving) pins the "
-                    "positive fraction. Trained by local_test/train_detector.py."
+                    "hard-positive data augmentation (self-generated 'roboticized' "
+                    "variants of the public human examples, labeled as bots, "
+                    "training side only); within-query rank-budget shaping "
+                    "(order-preserving) pins the positive fraction. Trained by "
+                    "local_test/train_detector.py."
                 ),
                 "open_source": True,
                 "inference_mode": "remote",
                 "training_data_statement": (
-                    "Trained exclusively on public Poker44 benchmark API releases (all "
-                    "banked releases). Captured live validator payloads are used ONLY to "
-                    "verify input-format parity and feature transfer; they are never used "
-                    "as training data."
+                    "Training data is derived exclusively from public Poker44 benchmark "
+                    "API releases (all banked releases): the releases themselves plus "
+                    "self-generated data augmentation ('roboticized' variants of the "
+                    "releases' human examples, labeled as bots; generation code in "
+                    "local_test/train_detector.py). Captured live validator payloads are "
+                    "used ONLY to verify input-format parity and feature transfer; they "
+                    "are never used as training data."
                 ),
                 "training_data_sources": [
                     "https://api.poker44.net/api/v1/benchmark (releases 2026-07-15, 2026-07-16)"

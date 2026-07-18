@@ -12,7 +12,10 @@ DATA: every release banked in local_test/data/release_*.json (real_eval.py
 banks the newest release daily; backfill_releases.py recovers history).
 Before featurizing, every benchmark hand is re-canonicalized through
 poker44.validator.payload_view.build_miner_payload_hand (see
-load_all_releases for why).
+load_all_releases for why). AUGMENTATION: a fraction of each release's real
+human groups is "roboticized" (bot-like regularity injected) and added to
+the TRAINING side as hard positives — see the ROBO_* block; disable with
+--no-robo. Held-out validation folds never contain augmented data.
 
 VALIDATION: leave-one-release-out over the FULL-SIZE releases (>=100
 groups). Small pilot releases still contribute training data to the final
@@ -27,8 +30,10 @@ Run:
 """
 from __future__ import annotations
 
+import copy
 import json
 import sys
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -98,6 +103,175 @@ GATE1_LORO_MIN = 0.84
 GATE2_STD_MIN = 0.08
 GATE2_MID_FRAC_MIN = 0.5
 GATE2_MID_LO, GATE2_MID_HI = 0.15, 0.70
+
+# ---- Roboticized hard positives (data augmentation) ------------------------
+# For a fraction of each release's REAL HUMAN groups, generate one
+# "roboticized" variant: the same session with bot-like regularity injected
+# (repeated action-line templates, street-modal action smoothing, bet-size
+# quantization to a small grid). The variant is labeled BOT and added to the
+# TRAINING side only — LORO held-out folds stay pure benchmark data, so the
+# reported numbers remain comparable across model generations. These are hard
+# positives: 55-75% human residue with robotic regularity layered on top,
+# which sharpens the decision boundary exactly where well-disguised real bots
+# operate (the benchmark's own synthetic bots are mostly easy positives).
+ROBO_ENABLED = "--no-robo" not in sys.argv
+ROBO_VERSION = 1            # bump to invalidate cached robo features
+ROBO_FRACTION = 0.5         # fraction of each release's human groups augmented
+ROBO_SEVERITIES = (0.25, 0.45)  # cycled deterministically across picked groups
+
+
+def _robo_rng(date: str, tag: str) -> np.random.RandomState:
+    """Deterministic per-release RNG (no global seed coupling)."""
+    return np.random.RandomState(zlib.crc32(f"robo|{tag}|{date}".encode()) & 0x7FFFFFFF)
+
+
+def _remap_template_actions(tmpl_actions: list, hand: dict) -> list:
+    """Copy a template action line onto `hand`, remapping the template's
+    actor seats onto the hand's own seats (order of first appearance,
+    cycling). Keeps the repeated PATTERN while staying structurally
+    plausible for this table."""
+    acts = copy.deepcopy(tmpl_actions)
+    own_seats = sorted({
+        int(p.get("seat")) for p in hand.get("players", [])
+        if isinstance(p, dict) and p.get("seat")
+    })
+    if not own_seats:
+        return acts
+    tmpl_seats: list = []
+    for act in acts:
+        seat = act.get("actor_seat")
+        if seat is not None and seat not in tmpl_seats:
+            tmpl_seats.append(seat)
+    mapping = {s: own_seats[i % len(own_seats)] for i, s in enumerate(tmpl_seats)}
+    for act in acts:
+        if act.get("actor_seat") in mapping:
+            act["actor_seat"] = mapping[act["actor_seat"]]
+    return acts
+
+
+def _roboticize_group(hands: list, severity: float, rng: np.random.RandomState) -> list:
+    """Return a bot-labeled variant of a real human group (hard positive).
+
+    Three graded transforms, each applied with probability ~ `severity`:
+      (a) template repetition — a small pool of action lines gets reused
+          across hands (raises n-gram concentration, lowers cross-hand
+          variance: the classic scripted-bot signature);
+      (b) street-modal action smoothing — actions drift toward the group's
+          modal action for that street (lowers action entropy);
+      (c) bet-size quantization — nonzero amounts snap to a 3-level grid
+          from the group's own quantiles (kills bet-size uniqueness).
+    Action COUNTS are never changed, so the <5-action hand filter and the
+    5-8 action live windowing see the same structure as the original."""
+    hands = copy.deepcopy(hands)
+    usable = [
+        h for h in hands
+        if isinstance(h, dict) and isinstance(h.get("actions"), list) and h["actions"]
+    ]
+    if len(usable) < 4:
+        return hands
+
+    # (a) template repetition
+    n_templates = max(2, int(round(6 * (1.0 - severity))))
+    t_idx = rng.choice(len(usable), size=min(n_templates, len(usable)), replace=False)
+    templates = [copy.deepcopy(usable[i]["actions"]) for i in t_idx]
+    for hand in usable:
+        if rng.random_sample() < severity:
+            tmpl = templates[rng.randint(len(templates))]
+            hand["actions"] = _remap_template_actions(tmpl, hand)
+
+    # street-modal actions + canonical amount grid, from the (post-template)
+    # group itself so every robo group is self-consistent
+    by_street: dict = {}
+    amounts: list = []
+    normed: list = []
+    for hand in usable:
+        for act in hand["actions"]:
+            a_type = str(act.get("action_type") or "")
+            if a_type:
+                by_street.setdefault(str(act.get("street") or ""), []).append(a_type)
+            if float(act.get("amount") or 0.0) > 0:
+                amounts.append(float(act["amount"]))
+            if float(act.get("normalized_amount_bb") or 0.0) > 0:
+                normed.append(float(act["normalized_amount_bb"]))
+    modal = {}
+    for street, types in by_street.items():
+        vals, counts = np.unique(types, return_counts=True)
+        modal[street] = str(vals[np.argmax(counts)])
+    canon_amt = np.quantile(amounts, [0.25, 0.5, 0.75]).tolist() if amounts else []
+    canon_nrm = np.quantile(normed, [0.25, 0.5, 0.75]).tolist() if normed else []
+
+    for hand in usable:
+        for act in hand["actions"]:
+            # (b) street-modal action smoothing
+            street = str(act.get("street") or "")
+            if street in modal and rng.random_sample() < severity * 0.6:
+                new_type = modal[street]
+                act["action_type"] = new_type
+                if new_type in ("fold", "check"):
+                    act["amount"] = 0
+                    act["normalized_amount_bb"] = 0
+                    act["raise_to"] = None
+                    act["call_to"] = None
+            # (c) bet-size quantization
+            if canon_amt and float(act.get("amount") or 0.0) > 0 \
+                    and rng.random_sample() < severity:
+                val = float(act["amount"])
+                act["amount"] = min(canon_amt, key=lambda c: abs(c - val))
+                if canon_nrm and float(act.get("normalized_amount_bb") or 0.0) > 0:
+                    nv = float(act["normalized_amount_bb"])
+                    act["normalized_amount_bb"] = min(canon_nrm, key=lambda c: abs(c - nv))
+    return hands
+
+
+def load_robo_features() -> dict:
+    """Roboticized hard positives per release: {date: X_robo} over the full
+    CANDIDATE_FEATURES matrix. Deterministic (per-release seeded RNG) and
+    cached per (CACHE_VERSION, ROBO_VERSION). Groups are parity-transformed
+    BEFORE roboticization so the transforms operate on the exact miner-
+    visible view the model trains and serves on."""
+    if not ROBO_ENABLED:
+        return {}
+    robo: dict = {}
+    for path in sorted(DATA_DIR.glob("release_*.json")):
+        date = path.stem.replace("release_", "")
+        cache_path = DATA_DIR / f"features_robo_{date}.json"
+        X = None
+        if cache_path.exists():
+            try:
+                with open(cache_path) as fh:
+                    cached = json.load(fh)
+                if (cached.get("features") == CANDIDATE_FEATURES
+                        and cached.get("cache_version") == CACHE_VERSION
+                        and cached.get("robo_version") == ROBO_VERSION):
+                    X = np.asarray(cached["X"], dtype=float)
+            except Exception:
+                X = None
+        if X is None:
+            with open(path) as fh:
+                data = json.load(fh)
+            labels = np.asarray(data["labels"], dtype=int)
+            human_idx = np.flatnonzero(labels == 0)
+            if not len(human_idx):
+                robo[date] = np.zeros((0, len(CANDIDATE_FEATURES)))
+                continue
+            sel_rng = _robo_rng(date, "select")
+            n_pick = max(1, int(round(ROBO_FRACTION * len(human_idx))))
+            picked = sel_rng.choice(human_idx, size=n_pick, replace=False)
+            rows = []
+            for k, gi in enumerate(sorted(picked.tolist())):
+                grp = [build_miner_payload_hand(h) for h in data["groups"][gi]]
+                severity = ROBO_SEVERITIES[k % len(ROBO_SEVERITIES)]
+                grp = _roboticize_group(grp, severity, _robo_rng(date, f"g{gi}"))
+                feats = extract_features(grp)
+                rows.append([feats[k2] for k2 in CANDIDATE_FEATURES])
+            X = np.asarray(rows, dtype=float)
+            with open(cache_path, "w") as fh:
+                json.dump({"features": CANDIDATE_FEATURES,
+                           "cache_version": CACHE_VERSION,
+                           "robo_version": ROBO_VERSION,
+                           "X": X.tolist()}, fh)
+        robo[date] = X
+    return robo
 
 
 def load_all_releases():
@@ -446,6 +620,29 @@ def main() -> None:
     # serving analog ranks within the incoming request).
     releases_rank = {d: _rank_matrix(Xr) for d, Xr, _ in releases}
 
+    # ---- roboticized hard positives (TRAIN-side augmentation only) ----
+    # aug[d] = (X_aug, y_aug, rank_aug): the release's real groups plus its
+    # robo variants (labeled bot), with the rank view computed over the
+    # COMBINED block — mimicking a live request that contains subtle bots.
+    # Held-out LORO views never touch aug (test purity).
+    robo_feats = {d: Xb[:, cols] for d, Xb in load_robo_features().items()}
+    aug = {}
+    n_robo = 0
+    for d, Xr, yr in releases:
+        Xb = robo_feats.get(d)
+        if Xb is not None and len(Xb):
+            X_aug = np.vstack([Xr, Xb])
+            y_aug = np.concatenate([yr, np.ones(len(Xb), dtype=int)])
+            n_robo += len(Xb)
+        else:
+            X_aug, y_aug = Xr, yr
+        aug[d] = (X_aug, y_aug, _rank_matrix(X_aug))
+    if ROBO_ENABLED:
+        print(f"[robo] {n_robo} roboticized hard positives across "
+              f"{sum(1 for v in robo_feats.values() if len(v))} releases "
+              f"(fraction={ROBO_FRACTION}, severities={ROBO_SEVERITIES}; "
+              f"train-side only)")
+
     full = [(d, X, y) for d, X, y in releases if len(y) >= FULL_SIZE_MIN_GROUPS]
     print(f"[data] {len(full)} full-size validation folds | "
           f"{len(features)} gated features")
@@ -459,9 +656,13 @@ def main() -> None:
         (within-release rank views) + human-manifold one-class (fit on
         train-side HUMANS only) + tri-blend weights and threshold from
         train-side OOF. Scores the held-out date exactly as serving would."""
-        X_tr = np.vstack([X for d, X, _ in releases if d != date])
-        y_tr = np.concatenate([y for d, _, y in releases if d != date])
-        X_tr_rank = np.vstack([releases_rank[d] for d, _, _ in releases if d != date])
+        # Train side uses the AUGMENTED per-release blocks (real + robo);
+        # the held-out release stays pure benchmark data, ranked among its
+        # own real groups only.
+        train_dates = [d for d, _, _ in releases if d != date]
+        X_tr = np.vstack([aug[d][0] for d in train_dates])
+        y_tr = np.concatenate([aug[d][1] for d in train_dates])
+        X_tr_rank = np.vstack([aug[d][2] for d in train_dates])
         X_te_rank = releases_rank[date]
 
         models = _fit_members(X_tr, y_tr)
@@ -473,7 +674,7 @@ def main() -> None:
         oof_rank = _gb_oof(X_tr_rank, y_tr)
 
         man = _fit_manifold(X_tr[y_tr == 0])
-        tr_sizes = [len(yr) for d, _, yr in releases if d != date]
+        tr_sizes = [len(aug[d][1]) for d in train_dates]
         oof_man = _ranks_within_blocks(_oof_manifold_dists(X_tr, y_tr), tr_sizes)
 
         tri_w, thr, _ = _tune_tri_blend(oof_raw, oof_rank, oof_man, y_tr)
@@ -498,10 +699,11 @@ def main() -> None:
     print(f"\n  LORO mean reward = {loro_mean:.4f}  "
           f"min={min(fold_rewards):.4f}  max={max(fold_rewards):.4f}")
 
-    # ---- final two-branch model: fit on ALL releases, OOF-tuned ----
-    X = np.vstack([Xr for _, Xr, _ in releases])
-    y = np.concatenate([yr for _, _, yr in releases])
-    X_rank = np.vstack([releases_rank[d] for d, _, _ in releases])
+    # ---- final model: fit on ALL releases (augmented blocks), OOF-tuned ----
+    all_dates = [d for d, _, _ in releases]
+    X = np.vstack([aug[d][0] for d in all_dates])
+    y = np.concatenate([aug[d][1] for d in all_dates])
+    X_rank = np.vstack([aug[d][2] for d in all_dates])
 
     final_models = _fit_members(X, y)
     final_oof = _oof_member_probs(X, y)
@@ -512,7 +714,7 @@ def main() -> None:
     oof_rank = _gb_oof(X_rank, y)
 
     final_man = _fit_manifold(X[y == 0])
-    all_sizes = [len(yr) for _, _, yr in releases]
+    all_sizes = [len(aug[d][1]) for d in all_dates]
     oof_man = _ranks_within_blocks(_oof_manifold_dists(X, y), all_sizes)
 
     tri_w, threshold, oof_rew = _tune_tri_blend(oof_raw, oof_rank, oof_man, y)

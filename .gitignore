@@ -216,3 +216,9 @@ local_test/data/
 local_test/logs/
 *.pdf
 local_test/captures/
+local_test/daily_retrain.sh
+local_test/MASTER_PLAN.md
+local_test/INNOVATION_PLAN.md
+
+# Live A/B champion/challenger harness (operational doctrine; keep private)
+local_test/ab_harness.py
