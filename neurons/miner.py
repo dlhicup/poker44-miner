@@ -93,7 +93,7 @@ class Miner(BaseMinerNeuron):
             ],
             defaults={
                 "model_name": "poker44-behavioral-ensemble",
-                "model_version": "6.1.0",
+                "model_version": "7.0.0",
                 "framework": "python-tree-ensemble",
                 "license": "MIT",
                 "repo_url": "https://github.com/dlhicup/poker44-miner",
@@ -101,7 +101,9 @@ class Miner(BaseMinerNeuron):
                     "Multi-branch blend, pure-python inference, OOF-tuned weights: "
                     "raw-feature tree ensemble + request-relative RANK branch (each "
                     "feature's percentile rank within the incoming request — immune "
-                    "to benchmark->live scale drift by construction) + optional "
+                    "to benchmark->live scale drift by construction, and run over a "
+                    "WIDER feature set than the raw branch since ranking is "
+                    "location/scale invariant) + optional "
                     "human-typicality MANIFOLD branch (one-class Ledoit-Wolf "
                     "Mahalanobis fitted on real human examples only; shipped only "
                     "when selected by the OOF weight tuner). Transfer-gated "

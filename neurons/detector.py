@@ -554,13 +554,22 @@ def score_chunks_batch(chunks: List[List[Dict[str, Any]]]) -> List[float]:
         return [score_chunk(c) for c in chunks]
 
     names = PARAMS["feature_names"]
-    rows: List[Any] = []
+    # The RANK branch may use a WIDER feature set than the raw/manifold
+    # branches: ranking is scale/location invariant, so mean-shifted features
+    # that the strict transfer gate drops for the absolute-scale raw branch
+    # still order chunks correctly and add live signal. Defaults to `names`
+    # for backward compatibility with pre-v7 params.
+    rank_names = PARAMS.get("rank_feature_names", names)
+    rows: List[Any] = []          # raw + manifold features (strict set)
+    rank_rows: List[Any] = []     # rank-branch features (wide set)
     for chunk in chunks:
         try:
             feats = extract_features(chunk)
             rows.append([feats[n] for n in names])
+            rank_rows.append([feats[n] for n in rank_names])
         except Exception:
             rows.append(None)
+            rank_rows.append(None)
     valid = [i for i, r in enumerate(rows) if r is not None]
 
     raw_p: Dict[int, float] = {
@@ -568,10 +577,10 @@ def score_chunks_batch(chunks: List[List[Dict[str, Any]]]) -> List[float]:
     }
     rank_p: Dict[int, float] = {}
     if len(valid) >= 8:
-        cols = list(zip(*[rows[i] for i in valid]))
+        cols = list(zip(*[rank_rows[i] for i in valid]))
         ranked = [percentile_ranks(list(col)) for col in cols]
         for pos, i in enumerate(valid):
-            x_rank = [ranked[j][pos] for j in range(len(names))]
+            x_rank = [ranked[j][pos] for j in range(len(rank_names))]
             rank_p[i] = _members_probability(PARAMS["rank_members"], x_rank)
     man = PARAMS.get("manifold")
     man_p: Dict[int, float] = {}

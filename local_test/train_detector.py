@@ -479,6 +479,30 @@ def _rank_matrix(X: np.ndarray) -> np.ndarray:
     return np.asarray(cols, dtype=float).T
 
 
+# Wide rank-branch feature set: the RANK branch ranks each feature within the
+# request, so a pure location/scale shift is invisible to it. It can therefore
+# safely use the moderately mean-shifted features the strict transfer gate
+# drops to protect the ABSOLUTE-scale raw branch. We keep every non-degenerate
+# feature and drop only the extreme (> RANK_WIDE_MAX_SHIFT SD) shifts.
+# Validated in local_test/exp_wide_rank.py: this MID set lifts rank-branch
+# LORO reward +0.007 at only +0.0015 std vs the strict-gated set.
+RANK_WIDE_MAX_SHIFT = 6.0
+
+
+def wide_rank_features(X_live: np.ndarray, X_bench: np.ndarray):
+    """Feature names for the scale-invariant rank branch (see RANK_WIDE_*)."""
+    out = []
+    for j, name in enumerate(CANDIDATE_FEATURES):
+        live, bench = X_live[:, j], X_bench[:, j]
+        ls, bs = float(np.std(live)), float(np.std(bench))
+        if ls < 1e-6 or bs < 1e-6:
+            continue  # degenerate on either side — useless even ranked
+        shift = abs(float(np.mean(live)) - float(np.mean(bench))) / max(bs, 1e-9)
+        if shift <= RANK_WIDE_MAX_SHIFT:
+            out.append(name)
+    return out
+
+
 def _gb_oof(X: np.ndarray, y: np.ndarray) -> np.ndarray:
     """5-fold OOF probabilities for a single GBDT (rank-branch helper)."""
     oof = np.zeros(len(y))
@@ -614,29 +638,44 @@ def main() -> None:
     if not features:
         sys.exit("Transfer gate dropped every candidate feature — aborting.")
     cols = [CANDIDATE_FEATURES.index(name) for name in features]
+    # Wide feature set for the scale-invariant RANK branch (raw/manifold keep
+    # the strict `cols`). See wide_rank_features / exp_wide_rank.py.
+    rank_features = wide_rank_features(X_live, X_all_cand[bench_idx])
+    rank_cols = [CANDIDATE_FEATURES.index(name) for name in rank_features]
+    print(f"[rank-wide] rank branch uses {len(rank_features)} features "
+          f"(vs {len(features)} strict-gated for raw/manifold)")
+    # Wide-sliced copies (for the rank branch) must be taken from the FULL
+    # candidate matrices BEFORE `releases` is narrowed to the strict set.
+    releases_wide = {d: Xr[:, rank_cols] for d, Xr, _ in releases}
     releases = [(d, Xr[:, cols], yr) for d, Xr, yr in releases]
     X_live = X_live[:, cols]
-    # Rank-branch training views: percentile ranks WITHIN each release (the
-    # serving analog ranks within the incoming request).
-    releases_rank = {d: _rank_matrix(Xr) for d, Xr, _ in releases}
+    # Rank-branch training views: percentile ranks WITHIN each release over the
+    # WIDE set (the serving analog ranks within the incoming request).
+    releases_rank = {d: _rank_matrix(releases_wide[d]) for d in releases_wide}
 
     # ---- roboticized hard positives (TRAIN-side augmentation only) ----
     # aug[d] = (X_aug, y_aug, rank_aug): the release's real groups plus its
-    # robo variants (labeled bot), with the rank view computed over the
-    # COMBINED block — mimicking a live request that contains subtle bots.
-    # Held-out LORO views never touch aug (test purity).
-    robo_feats = {d: Xb[:, cols] for d, Xb in load_robo_features().items()}
+    # robo variants (labeled bot). X_aug is the STRICT set (raw/manifold);
+    # rank_aug is the WIDE set ranked over the COMBINED block — mimicking a
+    # live request that contains subtle bots. Held-out LORO views never touch
+    # aug (test purity).
+    robo_all = load_robo_features()
+    robo_feats = {d: Xb[:, cols] for d, Xb in robo_all.items()}
+    robo_feats_wide = {d: Xb[:, rank_cols] for d, Xb in robo_all.items()}
     aug = {}
     n_robo = 0
     for d, Xr, yr in releases:
         Xb = robo_feats.get(d)
+        Xrw = releases_wide[d]
         if Xb is not None and len(Xb):
+            Xbw = robo_feats_wide[d]
             X_aug = np.vstack([Xr, Xb])
+            X_aug_rank = np.vstack([Xrw, Xbw])
             y_aug = np.concatenate([yr, np.ones(len(Xb), dtype=int)])
             n_robo += len(Xb)
         else:
-            X_aug, y_aug = Xr, yr
-        aug[d] = (X_aug, y_aug, _rank_matrix(X_aug))
+            X_aug, X_aug_rank, y_aug = Xr, Xrw, yr
+        aug[d] = (X_aug, y_aug, _rank_matrix(X_aug_rank))
     if ROBO_ENABLED:
         print(f"[robo] {n_robo} roboticized hard positives across "
               f"{sum(1 for v in robo_feats.values() if len(v))} releases "
@@ -800,6 +839,7 @@ def main() -> None:
     payload = {
         "model": "rank_blend",
         "feature_names": features,
+        "rank_feature_names": rank_features,
         "threshold": threshold,
         "w_raw": w_raw,
         "weights": tri_w,
