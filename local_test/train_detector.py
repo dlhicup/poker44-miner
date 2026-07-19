@@ -106,18 +106,30 @@ GATE2_MID_LO, GATE2_MID_HI = 0.15, 0.70
 
 # ---- Roboticized hard positives (data augmentation) ------------------------
 # For a fraction of each release's REAL HUMAN groups, generate one
-# "roboticized" variant: the same session with bot-like regularity injected
-# (repeated action-line templates, street-modal action smoothing, bet-size
-# quantization to a small grid). The variant is labeled BOT and added to the
-# TRAINING side only — LORO held-out folds stay pure benchmark data, so the
-# reported numbers remain comparable across model generations. These are hard
-# positives: 55-75% human residue with robotic regularity layered on top,
-# which sharpens the decision boundary exactly where well-disguised real bots
-# operate (the benchmark's own synthetic bots are mostly easy positives).
+# "roboticized" variant: the same session with ONE bot-like regularity
+# archetype injected MILDLY. The variant is labeled BOT and added to the
+# TRAINING side only — LORO held-out folds stay pure benchmark data.
+#
+# v2 (calibrated to the LIVE band): the v1 roboticizer stacked three
+# transforms at severity 0.25/0.45 and produced synthetic bots scoring ~0.84
+# on the deployed model — i.e. as easy as the benchmark's own cartoon bots,
+# and therefore redundant (diagnosis: local_test/exp_robo_realism.py). Real
+# undetected bots live in the LIVE-ambiguous band (~0.54). v2 fixes this: a
+# SINGLE archetype per group at MILD severity (0.12-0.22) lands synthetic bots
+# at a ~0.56 median — squarely in the live band — so they populate the
+# near-boundary region with known positives instead of duplicating easy ones.
+# Only the two archetypes that reach the band are kept (repeat, entropy);
+# "imbalance"/"mirror" were too weak (would label human-looking chunks as bots
+# and hurt FPR). Validated in local_test/exp_robo_v2.py.
 ROBO_ENABLED = "--no-robo" not in sys.argv
-ROBO_VERSION = 1            # bump to invalidate cached robo features
+ROBO_VERSION = 2            # bump to invalidate cached robo features
 ROBO_FRACTION = 0.5         # fraction of each release's human groups augmented
-ROBO_SEVERITIES = (0.25, 0.45)  # cycled deterministically across picked groups
+# (archetype, severity) cycled deterministically across picked groups; every
+# entry lands the synthetic bot in the live-realistic score band.
+ROBO_SCHEDULE = (
+    ("repeat", 0.13), ("entropy", 0.16),
+    ("repeat", 0.18), ("entropy", 0.21),
+)
 
 
 def _robo_rng(date: str, tag: str) -> np.random.RandomState:
@@ -149,19 +161,21 @@ def _remap_template_actions(tmpl_actions: list, hand: dict) -> list:
     return acts
 
 
-def _roboticize_group(hands: list, severity: float, rng: np.random.RandomState) -> list:
+def _roboticize_group(hands: list, archetype: str, severity: float,
+                      rng: np.random.RandomState) -> list:
     """Return a bot-labeled variant of a real human group (hard positive).
 
-    Three graded transforms, each applied with probability ~ `severity`:
-      (a) template repetition — a small pool of action lines gets reused
-          across hands (raises n-gram concentration, lowers cross-hand
-          variance: the classic scripted-bot signature);
-      (b) street-modal action smoothing — actions drift toward the group's
-          modal action for that street (lowers action entropy);
-      (c) bet-size quantization — nonzero amounts snap to a 3-level grid
-          from the group's own quantiles (kills bet-size uniqueness).
-    Action COUNTS are never changed, so the <5-action hand filter and the
-    5-8 action live windowing see the same structure as the original."""
+    ONE archetype applied MILDLY (v2 — calibrated to the live-ambiguous band;
+    see the ROBO_* header). Action COUNTS are never changed, so the
+    <5-action hand filter and the 5-8 action live windowing see the same
+    structure as the original.
+
+      "repeat"  — reuse a small pool of action lines across a fraction of
+                  hands (raises n-gram concentration / cross-hand mirroring:
+                  the classic scripted-bot signature);
+      "entropy" — drift a fraction of actions toward each street's modal
+                  action (lowers action entropy without touching counts).
+    """
     hands = copy.deepcopy(hands)
     usable = [
         h for h in hands
@@ -170,56 +184,40 @@ def _roboticize_group(hands: list, severity: float, rng: np.random.RandomState) 
     if len(usable) < 4:
         return hands
 
-    # (a) template repetition
-    n_templates = max(2, int(round(6 * (1.0 - severity))))
-    t_idx = rng.choice(len(usable), size=min(n_templates, len(usable)), replace=False)
-    templates = [copy.deepcopy(usable[i]["actions"]) for i in t_idx]
-    for hand in usable:
-        if rng.random_sample() < severity:
-            tmpl = templates[rng.randint(len(templates))]
-            hand["actions"] = _remap_template_actions(tmpl, hand)
+    if archetype == "repeat":
+        n_templates = max(2, int(round(5 * (1.0 - severity))))
+        t_idx = rng.choice(len(usable), size=min(n_templates, len(usable)),
+                           replace=False)
+        templates = [copy.deepcopy(usable[i]["actions"]) for i in t_idx]
+        for hand in usable:
+            if rng.random_sample() < severity:
+                tmpl = templates[rng.randint(len(templates))]
+                hand["actions"] = _remap_template_actions(tmpl, hand)
 
-    # street-modal actions + canonical amount grid, from the (post-template)
-    # group itself so every robo group is self-consistent
-    by_street: dict = {}
-    amounts: list = []
-    normed: list = []
-    for hand in usable:
-        for act in hand["actions"]:
-            a_type = str(act.get("action_type") or "")
-            if a_type:
-                by_street.setdefault(str(act.get("street") or ""), []).append(a_type)
-            if float(act.get("amount") or 0.0) > 0:
-                amounts.append(float(act["amount"]))
-            if float(act.get("normalized_amount_bb") or 0.0) > 0:
-                normed.append(float(act["normalized_amount_bb"]))
-    modal = {}
-    for street, types in by_street.items():
-        vals, counts = np.unique(types, return_counts=True)
-        modal[street] = str(vals[np.argmax(counts)])
-    canon_amt = np.quantile(amounts, [0.25, 0.5, 0.75]).tolist() if amounts else []
-    canon_nrm = np.quantile(normed, [0.25, 0.5, 0.75]).tolist() if normed else []
-
-    for hand in usable:
-        for act in hand["actions"]:
-            # (b) street-modal action smoothing
-            street = str(act.get("street") or "")
-            if street in modal and rng.random_sample() < severity * 0.6:
-                new_type = modal[street]
-                act["action_type"] = new_type
-                if new_type in ("fold", "check"):
-                    act["amount"] = 0
-                    act["normalized_amount_bb"] = 0
-                    act["raise_to"] = None
-                    act["call_to"] = None
-            # (c) bet-size quantization
-            if canon_amt and float(act.get("amount") or 0.0) > 0 \
-                    and rng.random_sample() < severity:
-                val = float(act["amount"])
-                act["amount"] = min(canon_amt, key=lambda c: abs(c - val))
-                if canon_nrm and float(act.get("normalized_amount_bb") or 0.0) > 0:
-                    nv = float(act["normalized_amount_bb"])
-                    act["normalized_amount_bb"] = min(canon_nrm, key=lambda c: abs(c - nv))
+    elif archetype == "entropy":
+        by_street: dict = {}
+        for hand in usable:
+            for act in hand["actions"]:
+                a_type = str(act.get("action_type") or "")
+                if a_type:
+                    by_street.setdefault(
+                        str(act.get("street") or ""), []).append(a_type)
+        modal = {}
+        for street, types in by_street.items():
+            vals, counts = np.unique(types, return_counts=True)
+            if len(vals):
+                modal[street] = str(vals[np.argmax(counts)])
+        for hand in usable:
+            for act in hand["actions"]:
+                street = str(act.get("street") or "")
+                if street in modal and rng.random_sample() < severity:
+                    new_type = modal[street]
+                    act["action_type"] = new_type
+                    if new_type in ("fold", "check"):
+                        act["amount"] = 0
+                        act["normalized_amount_bb"] = 0
+                        act["raise_to"] = None
+                        act["call_to"] = None
     return hands
 
 
@@ -260,8 +258,9 @@ def load_robo_features() -> dict:
             rows = []
             for k, gi in enumerate(sorted(picked.tolist())):
                 grp = [build_miner_payload_hand(h) for h in data["groups"][gi]]
-                severity = ROBO_SEVERITIES[k % len(ROBO_SEVERITIES)]
-                grp = _roboticize_group(grp, severity, _robo_rng(date, f"g{gi}"))
+                archetype, severity = ROBO_SCHEDULE[k % len(ROBO_SCHEDULE)]
+                grp = _roboticize_group(grp, archetype, severity,
+                                        _robo_rng(date, f"g{gi}"))
                 feats = extract_features(grp)
                 rows.append([feats[k2] for k2 in CANDIDATE_FEATURES])
             X = np.asarray(rows, dtype=float)
@@ -677,9 +676,10 @@ def main() -> None:
             X_aug, X_aug_rank, y_aug = Xr, Xrw, yr
         aug[d] = (X_aug, y_aug, _rank_matrix(X_aug_rank))
     if ROBO_ENABLED:
-        print(f"[robo] {n_robo} roboticized hard positives across "
+        print(f"[robo] {n_robo} roboticized hard positives (v2, live-band "
+              f"calibrated) across "
               f"{sum(1 for v in robo_feats.values() if len(v))} releases "
-              f"(fraction={ROBO_FRACTION}, severities={ROBO_SEVERITIES}; "
+              f"(fraction={ROBO_FRACTION}, schedule={ROBO_SCHEDULE}; "
               f"train-side only)")
 
     full = [(d, X, y) for d, X, y in releases if len(y) >= FULL_SIZE_MIN_GROUPS]

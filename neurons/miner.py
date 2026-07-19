@@ -93,7 +93,7 @@ class Miner(BaseMinerNeuron):
             ],
             defaults={
                 "model_name": "poker44-behavioral-ensemble",
-                "model_version": "7.0.0",
+                "model_version": "8.0.0",
                 "framework": "python-tree-ensemble",
                 "license": "MIT",
                 "repo_url": "https://github.com/dlhicup/poker44-miner",
@@ -111,7 +111,8 @@ class Miner(BaseMinerNeuron):
                     "through the live payload view for train/serve parity; "
                     "hard-positive data augmentation (self-generated 'roboticized' "
                     "variants of the public human examples, labeled as bots, "
-                    "training side only); within-query rank-budget shaping "
+                    "calibrated to the live-ambiguous score band, training side "
+                    "only); within-query rank-budget shaping "
                     "(order-preserving) pins the positive fraction. Trained by "
                     "local_test/train_detector.py."
                 ),
