@@ -93,12 +93,15 @@ class Miner(BaseMinerNeuron):
             ],
             defaults={
                 "model_name": "poker44-behavioral-ensemble",
-                "model_version": "8.0.0",
+                "model_version": "9.0.0",
                 "framework": "python-tree-ensemble",
                 "license": "MIT",
                 "repo_url": "https://github.com/dlhicup/poker44-miner",
                 "notes": (
-                    "Multi-branch blend, pure-python inference, OOF-tuned weights: "
+                    "Multi-branch blend, pure-python SUBSAMPLE-BAGGED inference "
+                    "(each large chunk is scored over 2-3 disjoint hand views and "
+                    "the branch outputs averaged — cuts within-request order "
+                    "variance from subsampling), OOF-tuned weights: "
                     "raw-feature tree ensemble + request-relative RANK branch (each "
                     "feature's percentile rank within the incoming request — immune "
                     "to benchmark->live scale drift by construction, and run over a "

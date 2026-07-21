@@ -137,6 +137,30 @@ def _parity_hands(chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [h for h in hands if len(h.get("actions") or []) >= 5]
 
 
+def _bag_views(chunk: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    """Disjoint subsample views of one chunk for bagged inference.
+
+    Round-5 forensics measured that the within-request score ORDER — the
+    quantity the reward's AP/recall terms read — was ~75-80% subsample
+    lottery: re-scoring the same request with alternative 35-of-n hand draws
+    yielded order self-Spearman of only ~0.25. Bagging averages that noise
+    away: split a large chunk into K disjoint interleaved views (hands
+    [k::K]), score each view independently, and average the branch outputs.
+    Each view still passes through _parity_hands (views >40 hands subsample
+    to 35), so every per-view statistic keeps the n~35-40 sampling
+    distribution the model was trained on — parity is preserved while
+    estimation variance drops ~1/K. Chunks of <=70 hands (all 30-40-hand
+    benchmark groups) return a single view: training-side behavior is
+    bit-identical to un-bagged inference. Live chunks bag at K=2 (72-105
+    hands) or K=3 (105+).
+    """
+    n = len(chunk)
+    if n <= 70:
+        return [chunk]
+    k = min(3, n // 35)
+    return [chunk[i::k] for i in range(k)]
+
+
 # Per-hand statistics, in the fixed order used to build CANDIDATE_FEATURES.
 _PER_HAND_STATS = (
     "fold_share",
@@ -560,44 +584,69 @@ def score_chunks_batch(chunks: List[List[Dict[str, Any]]]) -> List[float]:
     # still order chunks correctly and add live signal. Defaults to `names`
     # for backward compatibility with pre-v7 params.
     rank_names = PARAMS.get("rank_feature_names", names)
-    rows: List[Any] = []          # raw + manifold features (strict set)
-    rank_rows: List[Any] = []     # rank-branch features (wide set)
-    for chunk in chunks:
-        try:
-            feats = extract_features(chunk)
-            rows.append([feats[n] for n in names])
-            rank_rows.append([feats[n] for n in rank_names])
-        except Exception:
-            rows.append(None)
-            rank_rows.append(None)
-    valid = [i for i, r in enumerate(rows) if r is not None]
-
-    raw_p: Dict[int, float] = {
-        i: _members_probability(PARAMS["raw_members"], rows[i]) for i in valid
-    }
-    rank_p: Dict[int, float] = {}
-    if len(valid) >= 8:
-        cols = list(zip(*[rank_rows[i] for i in valid]))
-        ranked = [percentile_ranks(list(col)) for col in cols]
-        for pos, i in enumerate(valid):
-            x_rank = [ranked[j][pos] for j in range(len(rank_names))]
-            rank_p[i] = _members_probability(PARAMS["rank_members"], x_rank)
     man = PARAMS.get("manifold")
-    man_p: Dict[int, float] = {}
-    if man is not None:
-        if man.get("output") == "rank" and len(valid) >= 8:
-            # Distance-from-human graded on the day's curve: the ABSOLUTE
-            # Mahalanobis distance shifts between benchmark and live (joint
-            # covariance drift saturated a fixed sigmoid), but the ORDERING
-            # of distances within one request survives — so emit each
-            # chunk's percentile rank of distance within the request.
-            dists = [_manifold_distance(man, rows[i]) for i in valid]
-            ranked = percentile_ranks(dists)
-            for pos, i in enumerate(valid):
-                man_p[i] = ranked[pos]
-        else:
-            for i in valid:
-                man_p[i] = _manifold_probability(man, rows[i])
+
+    # BAGGED INFERENCE (see _bag_views): each bag scores one disjoint
+    # subsample view of every chunk through all branches; branch outputs are
+    # averaged across bags per chunk. Chunks with fewer views than n_bags
+    # cycle their views. For <=70-hand chunks (single view, e.g. the old
+    # live format) one bag runs and the math is identical to un-bagged.
+    views = [_bag_views(c) for c in chunks]
+    n_bags = max((len(v) for v in views), default=1)
+    raw_acc: Dict[int, List[float]] = {}
+    rank_acc: Dict[int, List[float]] = {}
+    man_acc: Dict[int, List[float]] = {}
+    any_valid: List[bool] = [False] * len(chunks)
+    for b in range(n_bags):
+        rows_b: List[Any] = []
+        rank_rows_b: List[Any] = []
+        for i in range(len(chunks)):
+            view = views[i][b % len(views[i])]
+            try:
+                feats = extract_features(view)
+                rows_b.append([feats[n] for n in names])
+                rank_rows_b.append([feats[n] for n in rank_names])
+            except Exception:
+                rows_b.append(None)
+                rank_rows_b.append(None)
+        valid_b = [i for i, r in enumerate(rows_b) if r is not None]
+        for i in valid_b:
+            any_valid[i] = True
+            raw_acc.setdefault(i, []).append(
+                _members_probability(PARAMS["raw_members"], rows_b[i])
+            )
+        if len(valid_b) >= 8:
+            cols = list(zip(*[rank_rows_b[i] for i in valid_b]))
+            ranked = [percentile_ranks(list(col)) for col in cols]
+            for pos, i in enumerate(valid_b):
+                x_rank = [ranked[j][pos] for j in range(len(rank_names))]
+                rank_acc.setdefault(i, []).append(
+                    _members_probability(PARAMS["rank_members"], x_rank)
+                )
+        if man is not None:
+            if man.get("output") == "rank" and len(valid_b) >= 8:
+                # Distance-from-human graded on the day's curve: the ABSOLUTE
+                # Mahalanobis distance shifts between benchmark and live
+                # (joint covariance drift saturated a fixed sigmoid), but the
+                # ORDERING of distances within one request survives — so emit
+                # each chunk's percentile rank of distance within the request.
+                dists = [_manifold_distance(man, rows_b[i]) for i in valid_b]
+                ranked_d = percentile_ranks(dists)
+                for pos, i in enumerate(valid_b):
+                    man_acc.setdefault(i, []).append(ranked_d[pos])
+            else:
+                for i in valid_b:
+                    man_acc.setdefault(i, []).append(
+                        _manifold_probability(man, rows_b[i])
+                    )
+
+    def _mean(vals: List[float]) -> float:
+        return sum(vals) / len(vals)
+
+    valid = [i for i in range(len(chunks)) if any_valid[i]]
+    raw_p: Dict[int, float] = {i: _mean(raw_acc[i]) for i in raw_acc}
+    rank_p: Dict[int, float] = {i: _mean(rank_acc[i]) for i in rank_acc}
+    man_p: Dict[int, float] = {i: _mean(man_acc[i]) for i in man_acc}
 
     # Branch weights: "weights" dict (raw/rank/manifold) with legacy
     # w_raw fallback. Missing branches renormalize among the present ones.
@@ -608,7 +657,7 @@ def score_chunks_batch(chunks: List[List[Dict[str, Any]]]) -> List[float]:
     }
     out: List[float] = []
     for i in range(len(chunks)):
-        if rows[i] is None:
+        if not any_valid[i]:
             out.append(_NEUTRAL_SCORE)
             continue
         parts = [("raw", raw_p[i])]
