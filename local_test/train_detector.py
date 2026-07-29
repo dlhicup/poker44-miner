@@ -46,6 +46,9 @@ from sklearn.ensemble import (
 )
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 REPO = Path("/home/client_7075_3/Projects/Poker44-subnet")
 sys.path.insert(0, str(REPO))
@@ -65,7 +68,9 @@ CAPTURES_DIR = REPO / "local_test" / "captures"
 # v4: expanded CANDIDATE_FEATURES matrix + parity re-canonicalization of the
 # benchmark hands through build_miner_payload_hand (see load_all_releases).
 # v5: action n-gram token features added to CANDIDATE_FEATURES.
-CACHE_VERSION = 5
+# v6: redundancy / scripted-ness features (red_*) — invariant bot-repetition
+#     signal that transfers across bot generations (v10).
+CACHE_VERSION = 6
 TARGET_HUMAN_FPR = 0.07     # <=7% humans over 0.5 (validator gate allows 10%)
 FULL_SIZE_MIN_GROUPS = 100  # releases smaller than this are pilot-era noise
 GATE_BENCH_SAMPLE = 200     # benchmark chunks sampled for the transfer gate
@@ -86,11 +91,30 @@ FOREST_PARAMS = dict(
     random_state=0,
     n_jobs=1,
 )
-# Blend-weight grid: all (w_gb, w_et, w_rf) on the 0.1-step simplex.
+# Smooth non-tree member (v10). The top miners' deployed models are exactly
+# this class; it extrapolates gracefully on out-of-distribution live inputs
+# where the tree members over-fire, and it DECORRELATES from the trees on the
+# live feed (Spearman 0.23) — validated in local_test/exp_mlp_member.py. A
+# lean (128,64) net keeps the pure-python export small and the many fits (OOF
+# x LORO folds) tractable while preserving the smooth-learner benefit.
+MLP_PARAMS = dict(
+    hidden_layer_sizes=(128, 64),
+    alpha=1e-3,
+    batch_size=64,
+    learning_rate_init=1e-3,
+    max_iter=200,
+    early_stopping=True,
+    n_iter_no_change=12,
+    random_state=0,
+)
+# Raw-branch ensemble members (tree families + the smooth MLP).
+RAW_MEMBER_KEYS = ("gb", "et", "rf", "mlp")
+# Blend-weight grid: all (w_gb, w_et, w_rf, w_mlp) on the 0.1-step simplex.
 BLEND_GRID = [
-    (a / 10, b / 10, (10 - a - b) / 10)
+    (a / 10, b / 10, c / 10, (10 - a - b - c) / 10)
     for a in range(11)
     for b in range(11 - a)
+    for c in range(11 - a - b)
 ]
 # Raw-vs-rank branch blend grid. The rank-branch experiment showed a smooth
 # plateau (every w in 0.4-0.8 beat both single branches), so a coarse grid is
@@ -433,17 +457,19 @@ def oof_threshold(X: np.ndarray, y: np.ndarray) -> float:
 
 
 def _fit_members(X: np.ndarray, y: np.ndarray) -> dict:
-    """Fit the three ensemble members."""
+    """Fit the ensemble members (tree families + the smooth MLP). The MLP is
+    wrapped in a StandardScaler pipeline (nets need standardized inputs)."""
     return {
         "gb": GradientBoostingClassifier(**GBM_PARAMS).fit(X, y),
         "et": ExtraTreesClassifier(**FOREST_PARAMS).fit(X, y),
         "rf": RandomForestClassifier(**FOREST_PARAMS).fit(X, y),
+        "mlp": make_pipeline(StandardScaler(), MLPClassifier(**MLP_PARAMS)).fit(X, y),
     }
 
 
 def _oof_member_probs(X: np.ndarray, y: np.ndarray) -> dict:
     """5-fold out-of-fold class-1 probabilities for each member family."""
-    oof = {k: np.zeros(len(y)) for k in ("gb", "et", "rf")}
+    oof = {k: np.zeros(len(y)) for k in RAW_MEMBER_KEYS}
     for tr, te in StratifiedKFold(5, shuffle=True, random_state=0).split(X, y):
         fold_models = _fit_members(X[tr], y[tr])
         for key, model in fold_models.items():
@@ -456,20 +482,21 @@ def _tune_blend(oof: dict, y: np.ndarray) -> tuple:
     maximizing the authoritative validator reward. Returns
     (weights_dict, threshold, oof_reward)."""
     best = (None, 0.5, -1.0)
-    for w_gb, w_et, w_rf in BLEND_GRID:
-        blend = w_gb * oof["gb"] + w_et * oof["et"] + w_rf * oof["rf"]
+    for w_gb, w_et, w_rf, w_mlp in BLEND_GRID:
+        blend = (w_gb * oof["gb"] + w_et * oof["et"]
+                 + w_rf * oof["rf"] + w_mlp * oof["mlp"])
         thr = float(np.quantile(blend[y == 0], 1.0 - TARGET_HUMAN_FPR))
         thr = min(max(thr, 0.05), 0.95)
         p = np.array([_calibrate(v, thr) for v in blend])
         rew, _ = reward(p, y.astype(bool))
         if rew > best[2]:
-            best = ({"gb": w_gb, "et": w_et, "rf": w_rf}, thr, rew)
+            best = ({"gb": w_gb, "et": w_et, "rf": w_rf, "mlp": w_mlp}, thr, rew)
     return best
 
 
 def _blend_probs(models: dict, weights: dict, X: np.ndarray) -> np.ndarray:
     return sum(
-        weights[k] * models[k].predict_proba(X)[:, 1] for k in ("gb", "et", "rf")
+        weights[k] * models[k].predict_proba(X)[:, 1] for k in RAW_MEMBER_KEYS
     )
 
 
@@ -712,7 +739,7 @@ def main() -> None:
         models = _fit_members(X_tr, y_tr)
         oof_members = _oof_member_probs(X_tr, y_tr)
         weights, _, _ = _tune_blend(oof_members, y_tr)
-        oof_raw = sum(weights[k] * oof_members[k] for k in ("gb", "et", "rf"))
+        oof_raw = sum(weights[k] * oof_members[k] for k in RAW_MEMBER_KEYS)
 
         rank_model = GradientBoostingClassifier(**GBM_PARAMS).fit(X_tr_rank, y_tr)
         oof_rank = _gb_oof(X_tr_rank, y_tr)
@@ -752,7 +779,7 @@ def main() -> None:
     final_models = _fit_members(X, y)
     final_oof = _oof_member_probs(X, y)
     weights, _, _ = _tune_blend(final_oof, y)
-    oof_raw = sum(weights[k] * final_oof[k] for k in ("gb", "et", "rf"))
+    oof_raw = sum(weights[k] * final_oof[k] for k in RAW_MEMBER_KEYS)
 
     final_rank = GradientBoostingClassifier(**GBM_PARAMS).fit(X_rank, y)
     oof_rank = _gb_oof(X_rank, y)
@@ -807,6 +834,28 @@ def main() -> None:
             })
         return out
 
+    def _export_mlp(pipeline, weight):
+        """StandardScaler + MLP -> flat weight matrices for pure-python
+        inference. sklearn coefs_[i] is (n_in, n_out); the server does
+        W[o][j], so transpose. Binary MLP: final layer is 1 logit -> sigmoid,
+        matching predict_proba[:, 1]."""
+        sc = pipeline.named_steps["standardscaler"]
+        mlp = pipeline.named_steps["mlpclassifier"]
+        layers = []
+        for W, b in zip(mlp.coefs_, mlp.intercepts_):
+            layers.append({
+                "W": [[float(W[j][o]) for j in range(W.shape[0])]
+                      for o in range(W.shape[1])],   # [n_out][n_in]
+                "b": [float(v) for v in b],
+            })
+        return {
+            "kind": "mlp",
+            "weight": weight,
+            "mean": [float(v) for v in sc.mean_],
+            "scale": [float(v) for v in sc.scale_],
+            "layers": layers,
+        }
+
     prior = float(np.clip(np.mean(y), 1e-9, 1 - 1e-9))
     init = float(np.log(prior / (1.0 - prior)))
     raw_members = [
@@ -827,6 +876,7 @@ def main() -> None:
             "weight": weights["rf"],
             "trees": _export_forest_trees(final_models["rf"]),
         },
+        _export_mlp(final_models["mlp"], weights["mlp"]),
     ]
     # Drop zero-weight members entirely — smaller file, faster inference.
     raw_members = [m for m in raw_members if m["weight"] > 0]
@@ -876,7 +926,7 @@ def main() -> None:
         f"PARAMS = _json.loads({body!r})\n"
     )
     size_kb = PARAMS_PATH.stat().st_size / 1024
-    n_trees = sum(len(m["trees"]) for m in raw_members + rank_members)
+    n_trees = sum(len(m.get("trees", [])) for m in raw_members + rank_members)
     print(f"[write] {PARAMS_PATH} ({size_kb:.0f} KB, {n_trees} trees, "
           f"{len(raw_members)} raw + {len(rank_members)} rank members)")
 

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import math
 import struct
+import zlib
 from collections import Counter
 from typing import Any, Dict, List
 
@@ -234,6 +235,118 @@ def _pot_bucket(amount: float, pot_before: float) -> str:
         return "p"
     return "o"
 
+# ---- REDUNDANCY / "scripted-ness" features (v10) --------------------------
+# Bot families change their style between epochs, but every scripted bot
+# shares one invariant: its hands REPEAT — near-identical action sequences,
+# low complexity, high mutual similarity. Humans vary. These features measure
+# self-redundancy of the chunk's bag of hands directly, so they detect
+# bot-ness rather than a specific bot's behaviour, and (unlike style features)
+# they transfer across bot generations. Every one is a ratio or a
+# length-normalized complexity, so 30- and 100-hand chunks stay comparable
+# (the transfer gate still vets each individually). Convergent with the new
+# leader miners (uid109/uid91), reimplemented independently.
+_REDUNDANCY_FEATURES = (
+    "red_dup_frac",        # fraction of hands that exactly repeat another hand
+    "red_top_word_share",  # share of the single most common action sequence
+    "red_gzip_ratio",      # zlib compressed size / raw size of concatenated hands
+    "red_lz76_norm",       # Lempel-Ziv-76 complexity, length-normalized
+    "red_bigram_jaccard",  # mean pairwise Jaccard of hands' action-bigram sets
+    "red_entropy_rate",    # order-1 conditional entropy of the action stream
+)
+
+
+def _lz76(s: str) -> int:
+    """Lempel-Ziv (1976) complexity: number of distinct substrings the
+    greedy parser needs to reconstruct s. Low = repetitive (scripted)."""
+    n = len(s)
+    if n == 0:
+        return 0
+    i = 0
+    c = 1
+    l = 1
+    k = 1
+    k_max = 1
+    while True:
+        if s[i + k - 1] == s[l + k - 1]:
+            k += 1
+            if l + k > n:
+                c += 1
+                break
+        else:
+            if k > k_max:
+                k_max = k
+            i += 1
+            if i == l:
+                c += 1
+                l += k_max
+                if l + 1 > n:
+                    break
+                i = 0
+                k = 1
+                k_max = 1
+            else:
+                k = 1
+    return c
+
+
+def _redundancy_features(words: List[str], bigram_sets: List[frozenset]) -> Dict[str, float]:
+    """Chunk-level self-redundancy over per-hand action 'words'."""
+    m = len(words)
+    out = {name: 0.0 for name in _REDUNDANCY_FEATURES}
+    if m < 2:
+        return out
+    counts = Counter(words)
+    out["red_dup_frac"] = 1.0 - len(counts) / m
+    out["red_top_word_share"] = counts.most_common(1)[0][1] / m
+
+    stream = "\x1f".join(words)  # unit-separator between hands
+    raw = stream.encode("utf-8", "ignore")
+    if raw:
+        out["red_gzip_ratio"] = len(zlib.compress(raw, 6)) / len(raw)
+    # LZ76 over a per-action symbol stream (collapse 2-char tokens to 1 symbol)
+    sym = "".join(words)
+    n = len(sym)
+    if n > 1:
+        out["red_lz76_norm"] = _lz76(sym) * math.log2(n) / n
+
+    # mean pairwise Jaccard of hands' action-bigram sets (subsample pairs
+    # deterministically for cost; complete for the 35-hand parity size)
+    idx = list(range(m))
+    if m > 40:
+        idx = idx[:: max(1, m // 40)][:40]
+    tot = 0.0
+    cnt = 0
+    for a in range(len(idx)):
+        sa = bigram_sets[idx[a]]
+        for b in range(a + 1, len(idx)):
+            sb = bigram_sets[idx[b]]
+            union = sa | sb
+            if union:
+                tot += len(sa & sb) / len(union)
+            cnt += 1
+    if cnt:
+        out["red_bigram_jaccard"] = tot / cnt
+
+    # order-1 conditional entropy H(next | current) over 2-char tokens
+    trans: Counter = Counter()
+    firsts: Counter = Counter()
+    toks: List[str] = []
+    for w in words:
+        toks.extend(w[j:j + 2] for j in range(0, len(w), 2))
+    for j in range(1, len(toks)):
+        firsts[toks[j - 1]] += 1
+        trans[(toks[j - 1], toks[j])] += 1
+    if firsts:
+        h = 0.0
+        total = sum(firsts.values())
+        for (t1, t2), c in trans.items():
+            p_joint = c / total
+            p_cond = c / firsts[t1]
+            h -= p_joint * math.log2(p_cond)
+        out["red_entropy_rate"] = h
+    return out
+
+
 # Candidate feature names for the trainer's transfer gate: every new
 # aggregate/chunk-level feature plus the scale-free legacy features. The
 # three betsize_* legacy features are EXCLUDED (verified 340x
@@ -242,6 +355,7 @@ CANDIDATE_FEATURES: List[str] = (
     [f"{stat}__{agg}" for stat in _PER_HAND_STATS for agg in _AGG_SUFFIXES]
     + list(_CHUNK_LEVEL_FEATURES)
     + list(_NGRAM_FEATURES)
+    + list(_REDUNDANCY_FEATURES)
     + [
         "flop_fold_rate",
         "turn_fold_rate",
@@ -279,6 +393,8 @@ def extract_features(chunk: List[Dict[str, Any]]) -> Dict[str, float]:
     sig_actor: Counter = Counter()
     sig_street: Counter = Counter()
     ngram_counts: Counter = Counter()
+    red_words: List[str] = []            # per-hand street+action token strings
+    red_bigrams: List[frozenset] = []    # per-hand action-bigram sets
 
     for hand in hands:
         actions = hand.get("actions") or []
@@ -371,13 +487,15 @@ def extract_features(chunk: List[Dict[str, Any]]) -> Dict[str, float]:
 
         # ---- n-gram tokens (counts accumulated chunk-wide) ---------------
         codes: List[str] = []
+        word_toks: List[str] = []   # 2-char street+action tokens for this hand
         for a in actions:
             code = _ACTION_CODE.get(str(a.get("action_type", "")))
+            street_c = _STREET_CODE.get(str(a.get("street", "")).lower())
             if code is None:
                 codes.append("")
                 continue
             codes.append(code)
-            street_c = _STREET_CODE.get(str(a.get("street", "")).lower())
+            word_toks.append((street_c or "x") + code)
             if street_c is not None:
                 ngram_counts[f"ng1_{street_c}{code}"] += 1
             if code in ("b", "r"):
@@ -389,6 +507,11 @@ def extract_features(chunk: List[Dict[str, Any]]) -> Dict[str, float]:
         for j in range(1, len(codes)):
             if codes[j - 1] and codes[j]:
                 ngram_counts[f"ng2_{codes[j - 1]}{codes[j]}"] += 1
+        # redundancy inputs: the hand's action "word" + its bigram set
+        red_words.append("".join(word_toks))
+        red_bigrams.append(
+            frozenset(word_toks[j - 1] + word_toks[j] for j in range(1, len(word_toks)))
+        )
 
     bet_counter = Counter(bets)
     n_bets = len(bets)
@@ -433,6 +556,9 @@ def extract_features(chunk: List[Dict[str, Any]]) -> Dict[str, float]:
     # ---- n-gram tokens, normalized per hand ------------------------------
     for token in _NGRAM_FEATURES:
         features[token] = ngram_counts[token] / n_h
+
+    # ---- redundancy / scripted-ness features (v10) -----------------------
+    features.update(_redundancy_features(red_words, red_bigrams))
 
     return features
 
@@ -512,6 +638,30 @@ def _member_probability(member: Dict[str, Any], x: List[float]) -> float:
         for tree in member["trees"]:
             logit += rate * _eval_tree(tree, x)
         return _sigmoid(logit)
+    if kind == "mlp":
+        # StandardScaler -> dense ReLU stack -> logistic. A smooth learner
+        # that extrapolates gracefully on out-of-distribution live inputs
+        # where the tree members over-fire (round-5 forensics; the top
+        # miners' deployed model is exactly this class).
+        mean = member["mean"]
+        scale = member["scale"]
+        a = [(x[i] - mean[i]) / scale[i] for i in range(len(mean))]
+        layers = member["layers"]
+        for li, layer in enumerate(layers):
+            W = layer["W"]          # shape [n_out][n_in]
+            b = layer["b"]
+            z = [0.0] * len(b)
+            for o in range(len(b)):
+                row = W[o]
+                acc = b[o]
+                for j in range(len(row)):
+                    acc += row[j] * a[j]
+                z[o] = acc
+            if li < len(layers) - 1:
+                a = [v if v > 0.0 else 0.0 for v in z]   # ReLU hidden
+            else:
+                a = z                                     # linear output logit
+        return _sigmoid(a[0])
     # kind == "forest": averaging classifier — each leaf already stores the
     # class-1 probability of that leaf; the forest averages over trees.
     total = 0.0
